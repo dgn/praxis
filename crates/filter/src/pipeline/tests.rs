@@ -3054,6 +3054,7 @@ async fn skip_to_excludes_skipped_filters_from_response() {
     let pipeline = with_body_indices(FilterPipeline {
         body_capabilities: BodyCapabilities::default(),
         compression: None,
+        connection_filters: Vec::new(),
         filters: vec![filter_a, filter_b, filter_c],
         record_filter_duration_metrics: false,
         route_templates: Arc::default(),
@@ -3134,6 +3135,7 @@ async fn skip_to_excludes_skipped_filters_from_body_hooks() {
     let pipeline = with_body_indices(FilterPipeline {
         body_capabilities: BodyCapabilities::default(),
         compression: None,
+        connection_filters: Vec::new(),
         filters: vec![filter_a, filter_b, filter_c],
         record_filter_duration_metrics: false,
         route_templates: Arc::default(),
@@ -3192,6 +3194,7 @@ async fn body_hooks_run_for_every_filter_before_the_request_phase() {
     let pipeline = with_body_indices(FilterPipeline {
         body_capabilities: BodyCapabilities::default(),
         compression: None,
+        connection_filters: Vec::new(),
         filters: vec![
             PipelineFilter::new(
                 0,
@@ -3263,6 +3266,7 @@ async fn all_executed_filters_run_on_response() {
     let pipeline = with_body_indices(FilterPipeline {
         body_capabilities: BodyCapabilities::default(),
         compression: None,
+        connection_filters: Vec::new(),
         filters: vec![
             PipelineFilter::new(
                 0,
@@ -3490,6 +3494,7 @@ async fn skipped_filter_skips_its_branches() {
     let pipeline = with_body_indices(FilterPipeline {
         body_capabilities: BodyCapabilities::default(),
         compression: None,
+        connection_filters: Vec::new(),
         filters: vec![parent],
         record_filter_duration_metrics: false,
         route_templates: Arc::default(),
@@ -5068,6 +5073,7 @@ fn test_pipeline(body_capabilities: BodyCapabilities, filters: Vec<PipelineFilte
     with_body_indices(FilterPipeline {
         body_capabilities,
         compression: None,
+        connection_filters: Vec::new(),
         filters,
         record_filter_duration_metrics: false,
         route_templates: Arc::default(),
@@ -5508,6 +5514,7 @@ fn make_pipeline(filters: Vec<Box<dyn HttpFilter>>) -> FilterPipeline {
     with_body_indices(FilterPipeline {
         body_capabilities,
         compression: None,
+        connection_filters: Vec::new(),
         filters,
         record_filter_duration_metrics: false,
         route_templates: Arc::default(),
@@ -5546,6 +5553,7 @@ fn make_pipeline_with_conditions(
     with_body_indices(FilterPipeline {
         body_capabilities,
         compression: None,
+        connection_filters: Vec::new(),
         filters,
         record_filter_duration_metrics: false,
         route_templates: Arc::default(),
@@ -5584,6 +5592,7 @@ fn make_pipeline_with_response_conditions(
     with_body_indices(FilterPipeline {
         body_capabilities,
         compression: None,
+        connection_filters: Vec::new(),
         filters,
         record_filter_duration_metrics: false,
         route_templates: Arc::default(),
@@ -6252,6 +6261,7 @@ fn streaming_capability_detected_when_filter_declares_it() {
     let pipeline = with_body_indices(FilterPipeline {
         body_capabilities: BodyCapabilities::default(),
         compression: None,
+        connection_filters: Vec::new(),
         filters: vec![streaming_pf],
         health_registry: None,
         id_generator: Arc::new(praxis_core::id::IdGenerator::new()),

@@ -483,6 +483,7 @@ mod tests {
     }
 
     /// Build a [`FilterPipeline`] wrapping the given TCP filters.
+    #[expect(clippy::too_many_lines, reason = "exhaustive FilterPipeline literal")]
     fn make_tcp_pipeline(filters: Vec<Box<dyn TcpFilter>>) -> FilterPipeline {
         let filters: Vec<_> = filters
             .into_iter()
@@ -492,6 +493,7 @@ mod tests {
         FilterPipeline {
             body_capabilities: BodyCapabilities::default(),
             compression: None,
+            connection_filters: vec![],
             filters,
             record_filter_duration_metrics: false,
             route_templates: Arc::default(),
@@ -526,9 +528,12 @@ mod tests {
             cluster: None,
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: std::time::Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         }
     }
 }

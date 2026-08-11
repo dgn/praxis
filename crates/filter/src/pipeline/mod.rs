@@ -113,6 +113,12 @@ pub struct FilterPipeline {
     /// Compression configuration, if a compression filter is present.
     compression: Option<CompressionConfig>,
 
+    /// Ordered list of connection-level filters (protocol framing).
+    ///
+    /// These take over the raw stream and run once per connection; the
+    /// `filters` list above runs per logical stream/request instead.
+    connection_filters: Vec<Box<dyn crate::connection_filter::ConnectionFilter>>,
+
     /// Ordered list of filters with their conditions and branches.
     pub(crate) filters: Vec<PipelineFilter>,
 
@@ -535,6 +541,16 @@ impl FilterPipeline {
     /// The shared health registry, if set.
     pub fn health_registry(&self) -> Option<&HealthRegistry> {
         self.health_registry.as_ref()
+    }
+
+    /// Connection-level filters in chain order.
+    pub fn connection_filters(&self) -> &[Box<dyn crate::connection_filter::ConnectionFilter>] {
+        &self.connection_filters
+    }
+
+    /// Whether this pipeline has any connection filters.
+    pub fn has_connection_filters(&self) -> bool {
+        !self.connection_filters.is_empty()
     }
 
     /// The shared request ID generator.

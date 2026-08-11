@@ -72,6 +72,7 @@ mod filter_metadata;
 mod fips;
 mod grpc_access_log;
 mod guardrails;
+mod h2_tunnel;
 mod health_check;
 mod hot_reload;
 mod http_active_requests;

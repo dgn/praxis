@@ -163,7 +163,7 @@ fn validate_single_listener(listener: &mut Listener) -> Result<(), ProxyError> {
     super::address::validate_address(&listener.address, &listener.name)?;
     validate_max_connections(listener)?;
 
-    if listener.protocol == ProtocolKind::Tcp {
+    if matches!(listener.protocol, ProtocolKind::Tcp | ProtocolKind::H2Tunnel) {
         validate_tcp_routing(listener)?;
     } else {
         reject_tcp_only_fields(listener)?;
@@ -178,7 +178,7 @@ fn validate_single_listener(listener: &mut Listener) -> Result<(), ProxyError> {
 
     super::timeouts::validate_listener_timeouts(listener)?;
 
-    if listener.protocol == ProtocolKind::Tcp {
+    if matches!(listener.protocol, ProtocolKind::Tcp | ProtocolKind::H2Tunnel) {
         super::timeouts::validate_tcp_max_duration(listener)?;
     }
 
@@ -306,6 +306,22 @@ listeners:
             err.to_string()
                 .contains("requires an upstream address, cluster, or filter chains"),
             "error should mention upstream, cluster, or filter chains: {err}"
+        );
+    }
+
+    #[test]
+    fn h2_tunnel_listener_without_upstream_or_chains_is_rejected() {
+        let yaml = r#"
+listeners:
+  - name: tunnel
+    address: "0.0.0.0:15008"
+    protocol: h2_tunnel
+"#;
+        let err = Config::from_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires an upstream address, cluster, or filter chains"),
+            "an H2 tunnel listener should be validated like a TCP listener: {err}"
         );
     }
 

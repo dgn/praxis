@@ -433,6 +433,40 @@ impl FilterRegistry {
         registration.factory.create(config, self)
     }
 
+    /// Instantiates a connection filter by type name and config.
+    ///
+    /// Connection filters are declared in a chain's `connection_filters` list
+    /// rather than `filters`, so they bypass [`AnyFilter`] construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the filter type is unknown or is not a
+    /// connection filter.
+    ///
+    /// [`AnyFilter`]: crate::AnyFilter
+    pub fn create_connection(
+        &self,
+        name: &str,
+        config: &serde_yaml::Value,
+    ) -> Result<Box<dyn crate::connection_filter::ConnectionFilter>, FilterError> {
+        let registration = self
+            .filters
+            .get(name)
+            .ok_or_else(|| -> FilterError { format!("unknown filter type: '{name}'").into() })?;
+        match &registration.factory {
+            RegisteredFilterFactory::Standard(factory) => factory.create_connection(config),
+            // Every non-standard factory builds an HTTP filter, which runs per
+            // request and can never own a connection. Absent when this build
+            // has only the standard kind.
+            #[cfg(any(
+                feature = "iterative-request-router",
+                feature = "chain-binding",
+                feature = "policy-engine"
+            ))]
+            _ => Err(format!("filter '{name}' is not a connection filter").into()),
+        }
+    }
+
     /// Instantiates a filter, supplying a [`ChainBindingContext`] so
     /// chain-binding filters can bind their outbound chains.
     ///

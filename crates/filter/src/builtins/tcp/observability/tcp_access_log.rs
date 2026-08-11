@@ -126,9 +126,12 @@ mod tests {
             cluster: None,
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         };
         let action = filter.on_connect(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "on_connect should continue");
@@ -145,9 +148,12 @@ mod tests {
             cluster: None,
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: Instant::now(),
             bytes_in: 1024,
             bytes_out: 2048,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         };
         filter.on_disconnect(&mut ctx).await.unwrap();
     }

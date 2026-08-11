@@ -44,6 +44,9 @@
 mod cert_watcher_shutdowns;
 pub use cert_watcher_shutdowns::CertWatcherShutdowns;
 
+mod connector;
+pub use connector::DirectConnector;
+
 mod pipelines;
 pub use pipelines::ListenerPipelines;
 
@@ -52,6 +55,8 @@ pub use protocol::Protocol;
 
 /// Process-wide connection limit.
 pub mod connections;
+/// `H2` CONNECT tunnel protocol.
+pub mod h2_tunnel;
 /// HTTP protocol implementations.
 pub mod http;
 /// Raw TCP/L4 forwarding protocol.

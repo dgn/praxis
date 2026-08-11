@@ -77,6 +77,13 @@ pub struct FilterChainConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
 
+    /// Ordered list of connection-level filters (protocol framing, TLS, etc.).
+    ///
+    /// These run once per connection and operate on the raw transport stream.
+    /// Empty for most chains — only needed for protocols like H2 CONNECT.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_filters: Vec<FilterEntry>,
+
     /// Ordered list of filters in this chain.
     #[serde(default)]
     pub filters: Vec<FilterEntry>,

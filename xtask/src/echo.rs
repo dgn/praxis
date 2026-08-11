@@ -67,6 +67,7 @@ fn build_config(args: &Args) -> Config {
         filter_chains: vec![FilterChainConfig {
             name: "echo".into(),
             conditions: Vec::new(),
+            connection_filters: vec![],
             filters: vec![entry],
         }],
         insecure_options: InsecureOptions::default(),

@@ -70,6 +70,34 @@ impl FilterPipeline {
         Ok(Self::from_filters(filters))
     }
 
+    /// Build a pipeline with both connection-level and per-request filters.
+    ///
+    /// Connection filters are instantiated from `connection_entries` and stored
+    /// on the pipeline alongside the regular filters, which are resolved
+    /// exactly as [`build_with_chains`] resolves them. Connection filters own
+    /// the raw stream and never see a request, so they take part in neither
+    /// branch resolution nor body-capability computation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if any filter fails to instantiate, or if a
+    /// filter is placed in the wrong list (a connection filter in `entries`,
+    /// or a request/TCP filter in `connection_entries`).
+    ///
+    /// [`build_with_chains`]: FilterPipeline::build_with_chains
+    pub fn build_with_connection_filters(
+        connection_entries: &mut [FilterEntry],
+        entries: &mut [FilterEntry],
+        registry: &FilterRegistry,
+        chains: &HashMap<&str, &[FilterEntry]>,
+        insecure_options: &InsecureOptions,
+    ) -> Result<Self, FilterError> {
+        let connection_filters = build_connection_filters(connection_entries, registry)?;
+        let mut pipeline = Self::build_with_chains(entries, registry, chains, insecure_options)?;
+        pipeline.connection_filters = connection_filters;
+        Ok(pipeline)
+    }
+
     /// Build a pipeline with branch chain resolution.
     ///
     /// Like [`build`], but also resolves `branch_chains` on each
@@ -139,6 +167,7 @@ impl FilterPipeline {
         let mut pipeline = Self {
             body_capabilities,
             compression,
+            connection_filters: Vec::new(),
             filters,
             request_body_filter_indices,
             response_body_filter_indices,
@@ -420,6 +449,23 @@ pub(super) fn reject_tcp_unsupported_fields(filter: &AnyFilter, entry: &FilterEn
         .into());
     }
     Ok(())
+}
+
+/// Instantiate the connection filters declared by a filter chain.
+///
+/// Connection filters take over the raw stream, so they are kept out of the
+/// [`PipelineFilter`] list and never see a request.
+fn build_connection_filters(
+    connection_entries: &mut [FilterEntry],
+    registry: &FilterRegistry,
+) -> Result<Vec<Box<dyn crate::connection_filter::ConnectionFilter>>, FilterError> {
+    let mut connection_filters = Vec::with_capacity(connection_entries.len());
+    for entry in connection_entries {
+        let filter = registry.create_connection(&entry.filter_type, &entry.config)?;
+        debug!(filter = filter.name(), "connection filter added to pipeline");
+        connection_filters.push(filter);
+    }
+    Ok(connection_filters)
 }
 
 /// Build the metadata-only cluster catalog for a binding-enabled pipeline from

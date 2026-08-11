@@ -8,7 +8,9 @@
 //!
 //! 1. Index top-level [`FilterChainConfig`]s by name.
 //! 2. Concatenate the listener's named chains into a flat `Vec<FilterEntry>`.
-//! 3. Instantiate filters via the [`FilterRegistry`] and resolve branch chains ([`FilterPipeline::build_with_chains`]).
+//! 3. Instantiate filters via the [`FilterRegistry`] and resolve branch chains
+//!    ([`FilterPipeline::build_with_connection_filters`]), which also builds the chain's connection-level filters onto
+//!    the same pipeline.
 //! 4. Apply body limits, health registry, and KV stores ([`configure_pipeline`]).
 //! 5. Validate ordering constraints ([`validate_pipeline`]).
 //!
@@ -48,11 +50,32 @@ include!(concat!(env!("OUT_DIR"), "/external_filters.rs"));
 /// that need a custom registry should use [`run_server_with_registry`]
 /// instead.
 ///
+/// Also registers the connection filters the protocol crate provides.
+/// They live there because they need the upstream connector and Pingora
+/// stream types, which `praxis-filter` sits below, so they cannot join
+/// [`with_builtins`] — this function is where the two meet.
+///
+/// # Panics
+///
+/// Never in a correct build: only on a duplicate filter name, which is a
+/// programming error rather than user input.
+///
 /// [`FilterRegistry`]: praxis_filter::FilterRegistry
 /// [`run_server_with_registry`]: crate::run_server_with_registry
+/// [`with_builtins`]: praxis_filter::FilterRegistry::with_builtins
 #[must_use]
+#[expect(clippy::expect_used, reason = "fixed name, no user input")]
 pub fn build_full_registry() -> FilterRegistry {
     let mut registry = FilterRegistry::with_builtins();
+    // A silent registration failure would drop the filter and turn
+    // `connection_filters: [h2_tunnel]` into an unknown-filter error at
+    // config load, so it must not be swallowed.
+    registry
+        .register(
+            "h2_tunnel",
+            praxis_filter::connection_builtin(praxis_protocol::h2_tunnel::H2TunnelFilter::from_config),
+        )
+        .expect("h2_tunnel is a unique built-in filter name");
     register_external_filters(&mut registry);
     registry
 }
@@ -183,19 +206,25 @@ pub(crate) fn resolve_pipelines_with_composition(
     let chains = expanded_chains.as_slices();
     let mut pipelines = HashMap::with_capacity(config.listeners.len());
     for listener in &config.listeners {
+        let mut connection_entries = expanded_chains.connection_filters_for_listener(listener)?;
         let mut entries = expanded_chains.for_listener(listener)?;
 
         validate_terminal_position(&entries, &listener.name)?;
 
-        // Snapshot the complete flattened entries before build_with_chains()
-        // drains conditions and branch chains out of them (via mem::take). The
+        // Snapshot the complete flattened entries before the build drains
+        // conditions and branch chains out of them (via mem::take). The
         // built-in ordering checks read those from the built pipeline's filters,
         // but downstream validators only see this snapshot, so it must retain
         // the full configuration or conditional filters and branch chains would
         // appear absent.
         let entry_snapshot = entries.clone();
-        let mut pipeline =
-            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
+        let mut pipeline = FilterPipeline::build_with_connection_filters(
+            &mut connection_entries,
+            &mut entries,
+            &registry,
+            &chains,
+            &config.insecure_options,
+        )?;
         configure_pipeline(
             &mut pipeline,
             config,

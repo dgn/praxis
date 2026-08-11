@@ -245,7 +245,11 @@ fn stats_gaps(snapshot: &metrics::StatsMetricsSnapshot) -> BTreeMap<&'static str
 fn listener_stats_view(meta: &ListenerMeta, snapshot: &metrics::StatsMetricsSnapshot) -> ListenerStatsView {
     let active_connections = match meta.protocol {
         ProtocolKind::Http => snapshot.http_active_by_listener.get(&meta.name).copied().unwrap_or(0),
-        ProtocolKind::Tcp => snapshot.tcp_active_by_listener.get(&meta.name).copied().unwrap_or(0),
+        // Tunnel listeners are stream listeners served by the TCP service,
+        // so their active gauge lives in the TCP map.
+        ProtocolKind::Tcp | ProtocolKind::H2Tunnel => {
+            snapshot.tcp_active_by_listener.get(&meta.name).copied().unwrap_or(0)
+        },
     };
 
     ListenerStatsView {

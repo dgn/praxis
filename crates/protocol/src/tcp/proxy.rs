@@ -21,7 +21,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use pingora_core::{apps::ServerApp, protocols::Stream, server::ShutdownWatch};
 use praxis_core::connectivity::is_private_upstream_ip;
-use praxis_filter::{FilterAction, FilterPipeline, TcpFilterContext};
+use praxis_filter::{ConnectionContext, ConnectionRuntime, FilterAction, FilterPipeline, TcpFilterContext};
 use praxis_tls::sni;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _, AsyncWrite, ReadBuf},
@@ -29,6 +29,8 @@ use tokio::{
     sync::{Semaphore, watch},
 };
 use tracing::{Instrument as _, Span, debug, error, info, info_span, trace, warn};
+
+use crate::DirectConnector;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -224,9 +226,12 @@ impl PingoraTcpProxy {
             cluster: self.cluster.clone(),
             health_registry: health_registry.as_ref(),
             kv_stores: pipeline.kv_stores(),
+            original_dst: None,
             connect_time,
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         };
 
         let result = resolve_connect_result(pipeline, &mut ctx, remote_addr).await;
@@ -263,9 +268,12 @@ impl PingoraTcpProxy {
             cluster: self.cluster.clone(),
             health_registry: health_registry.as_ref(),
             kv_stores: pipeline.kv_stores(),
+            original_dst: None,
             connect_time,
             bytes_in,
             bytes_out,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         };
         let _result = pipeline.execute_tcp_disconnect(&mut ctx).await;
     }
@@ -335,6 +343,39 @@ impl ServerApp for PingoraTcpProxy {
 
             info!("connection_accepted");
 
+            // Pin one pipeline generation for the whole connection so paired
+            // connect/disconnect filter state (e.g. least-connections counters)
+            // stays on the same instance across a hot reload.
+            let pipeline = self.pipeline.load_full();
+
+            // A connection filter takes ownership of the raw stream and frames
+            // the connection itself (TLS, PROXY protocol, H2 CONNECT), running
+            // the TCP sub-pipeline per logical stream. The proxy path below is
+            // therefore skipped entirely — but every admission permit above is
+            // still held for as long as `serve()` runs, and the listener's
+            // session timeouts travel on the runtime, so a connection filter
+            // bounds sessions and sheds load exactly like the proxy path does.
+            if let Some((head, rest)) = pipeline.connection_filters().split_first() {
+                let connector = DirectConnector::new(self.allow_private_upstreams);
+                let runtime = ConnectionRuntime::new(
+                    &pipeline,
+                    &connector,
+                    shutdown.clone(),
+                    self.session_timeout,
+                    self.max_duration,
+                    rest,
+                );
+                let conn_ctx = ConnectionContext {
+                    remote_addr: remote_addr.clone(),
+                    local_addr: local_addr.clone(),
+                    peer_identity: None,
+                };
+                if let Err(e) = head.serve(Box::new(session), conn_ctx, &runtime).await {
+                    warn!(remote = %remote_addr, error = %e, "connection filter error");
+                }
+                return None;
+            }
+
             let (sni_hostname, peeked_bytes) = if self.upstream_addr.is_none() {
                 let Ok(result) = tokio::time::timeout(SNI_PEEK_TIMEOUT, peek_sni(&mut session)).await else {
                     warn!(remote = %remote_addr, "SNI peek timed out, closing connection");
@@ -351,11 +392,6 @@ impl ServerApp for PingoraTcpProxy {
                 (None, Vec::new())
             };
             let peeked_len = u64::try_from(peeked_bytes.len()).unwrap_or(u64::MAX);
-
-            // Pin one pipeline generation for the whole connection so paired
-            // connect/disconnect filter state (e.g. least-connections counters)
-            // stays on the same instance across a hot reload.
-            let pipeline = self.pipeline.load_full();
 
             let upstream_addr = self
                 .run_connect_filters(
@@ -533,8 +569,9 @@ async fn resolve_connect_result(
 ///
 /// A rejection or error from a filter after `tcp_load_balancer` leaves the
 /// selected endpoint's in-flight counter incremented; only the disconnect
-/// hook releases it.
-async fn release_selected_endpoint(pipeline: &FilterPipeline, ctx: &mut TcpFilterContext<'_>) {
+/// hook releases it. Shared with the `H2` CONNECT tunnel, which runs the
+/// same connect-phase filters per stream.
+pub(crate) async fn release_selected_endpoint(pipeline: &FilterPipeline, ctx: &mut TcpFilterContext<'_>) {
     if ctx.upstream_addr.is_none() {
         return;
     }
@@ -856,7 +893,13 @@ impl AsyncWrite for CountingStream<'_> {
 /// config time but a private IP at connection time. The check is
 /// skipped when `allow_private` is `true`
 /// (`insecure_options.allow_private_upstreams`).
-async fn connect_upstream(upstream_addr: &str, allow_private: bool) -> Option<TcpStream> {
+///
+/// Shared with every other path that opens an upstream socket on
+/// behalf of a client-supplied address (the `H2` CONNECT tunnel and
+/// [`UpstreamConnector`](praxis_filter::UpstreamConnector)
+/// implementations), which must not grow their own unchecked
+/// `TcpStream::connect`.
+pub(crate) async fn connect_upstream(upstream_addr: &str, allow_private: bool) -> Option<TcpStream> {
     if let Ok(result) = tokio::time::timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         resolve_and_connect(upstream_addr, allow_private),
@@ -1189,9 +1232,12 @@ mod tests {
             cluster: Some(Arc::from(cluster)),
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: std::time::Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         }
     }
 

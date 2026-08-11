@@ -397,9 +397,12 @@ mod tests {
                 cluster: Some(Arc::from("cache")),
                 health_registry: None,
                 kv_stores: None,
+                original_dst: None,
                 connect_time: Instant::now(),
                 bytes_in: 0,
                 bytes_out: 0,
+                peer_identity: None,
+                extensions: http::Extensions::new(),
             };
             lb.on_connect(&mut ctx).await.unwrap();
             let addr = ctx.upstream_addr.unwrap().into_owned();
@@ -424,9 +427,12 @@ mod tests {
             cluster: None,
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         };
         let err = lb.on_connect(&mut ctx).await.unwrap_err();
         assert!(
@@ -503,9 +509,12 @@ clusters:
             cluster: None,
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         };
         lb.on_disconnect(&mut ctx).await.unwrap();
     }
@@ -548,9 +557,12 @@ clusters:
             cluster: Some(Arc::from(cluster)),
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         }
     }
 
@@ -564,9 +576,12 @@ clusters:
             cluster: Some(Arc::from(cluster)),
             health_registry: Some(registry),
             kv_stores: None,
+            original_dst: None,
             connect_time: Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         }
     }
 }

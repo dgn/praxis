@@ -47,6 +47,8 @@ mod binding;
 pub mod body;
 pub mod builtins;
 mod condition;
+mod connection_filter;
+mod connector;
 mod context;
 #[cfg(feature = "chain-binding")]
 mod credentials;
@@ -56,6 +58,7 @@ mod factory;
 mod filter;
 mod filtered_subrequest;
 mod grpc_response;
+mod io;
 pub mod json_ops;
 pub(crate) mod load_balancing;
 mod metrics;
@@ -125,6 +128,8 @@ pub use builtins::{
 #[cfg(feature = "policy-engine")]
 pub use builtins::{PolicyFilter, PolicyPluginFactoryFn, register_policy_plugin_factory};
 pub use condition::{should_execute, should_execute_response, should_execute_response_ref};
+pub use connection_filter::{ConnectionContext, ConnectionFilter, ConnectionRuntime};
+pub use connector::UpstreamConnector;
 pub use context::{
     HttpFilterContext, PendingHeaderResult, Request, Response, StreamTermination, StreamTerminationCause,
     SubRequestResponseMode, TrustedHeaderMutation,
@@ -136,8 +141,8 @@ pub use error_response::{
 };
 pub use extensions::{AuthenticatedIdentity, ClientResponseHeadersCommitted, RequestExtensions};
 pub use factory::{
-    EmptyFilterConfig, FilterFactory, HttpFilterFactory, TcpFilterFactory, http_builtin, parse_filter_config,
-    tcp_builtin,
+    ConnectionFilterFactory, EmptyFilterConfig, FilterFactory, HttpFilterFactory, TcpFilterFactory, connection_builtin,
+    http_builtin, parse_filter_config, tcp_builtin,
 };
 pub use filter::{Filter, FilterContext, FilterError, HttpFilter};
 pub use filtered_subrequest::{
@@ -145,6 +150,7 @@ pub use filtered_subrequest::{
     StagedUpstreamFallback, StreamBodySuppressed, SubrequestRuntime,
 };
 pub use grpc_response::GrpcErrorMapping;
+pub use io::{BoxedIo, IoStream};
 #[cfg(feature = "upstream-binding")]
 pub use pipeline::catalog::{ClusterApplicationCatalog, ClusterApplicationMetadata, ClusterMetadataDeclaration};
 pub use pipeline::{

@@ -46,6 +46,16 @@ macro_rules! register_filters {
             ),
         ).unwrap_or_else(|_| panic!("duplicate filter name: '{}'", $name));
     };
+    ( @register $registry:ident, connection $name:expr => $factory:expr ) => {
+        $registry.register(
+            $name,
+            $crate::FilterFactory::Connection(
+                ::std::sync::Arc::new(move |config: &serde_yaml::Value| {
+                    ($factory)(config)
+                }),
+            ),
+        ).unwrap_or_else(|_| panic!("duplicate filter name: '{}'", $name));
+    };
     ( $( $kind:ident $name:expr => $factory:expr ),* $(,)? ) => {
         /// Build a custom filter registry with builtins and user-registered filters.
         pub fn custom_registry() -> $crate::FilterRegistry {

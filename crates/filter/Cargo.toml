@@ -97,7 +97,7 @@ subtle = { workspace = true, optional = true }
 thiserror = { workspace = true }
 # Used by `policy-engine` for plugin `initialize()` at filter
 # construction and JWT identity plugins that fetch JWKS at init time.
-tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time", "net"] }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 url = { workspace = true, optional = true }

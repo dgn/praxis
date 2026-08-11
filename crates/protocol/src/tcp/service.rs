@@ -7,7 +7,10 @@ use std::{sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use pingora_core::services::listening::Service;
-use praxis_core::{ProxyError, config::Config};
+use praxis_core::{
+    ProxyError,
+    config::{Config, ProtocolKind},
+};
 use praxis_filter::{FilterPipeline, FilterRegistry};
 use tokio::sync::{Semaphore, watch};
 
@@ -20,8 +23,10 @@ use crate::{ListenerPipelines, Protocol};
 
 /// Pingora-backed raw TCP/L4 protocol implementation.
 ///
-/// Groups TCP listeners by `(upstream address, idle timeout, max duration)`,
-/// creating one bidirectional forwarder per unique combination. Implements [`Protocol`].
+/// Groups stream listeners by `(protocol, upstream address, cluster, session
+/// timeout, max duration)`, creating one bidirectional forwarder per unique
+/// combination. `H2` CONNECT tunnel listeners are stream listeners too, so
+/// they are served here as well. Implements [`Protocol`].
 ///
 /// [`Protocol`]: crate::Protocol
 pub struct PingoraTcp;
@@ -46,7 +51,7 @@ impl Protocol for PingoraTcp {
             cert_watcher_shutdowns.extend(tls::register_tcp_listeners(
                 &mut service,
                 &listeners,
-                group_key.0.as_deref(),
+                group_key.1.as_deref(),
             )?);
             server.server_mut().add_service(service);
         }
@@ -59,19 +64,15 @@ impl Protocol for PingoraTcp {
 // Service Construction
 // -----------------------------------------------------------------------------
 
-/// The listener group key: shared upstream address, cluster, idle timeout
-/// (ms), and max session duration (secs).
-type TcpGroupKey = (Option<String>, Option<String>, Option<u64>, Option<u64>);
-
 /// Build the TCP proxy service for one listener group.
 fn build_tcp_service(
-    group_key: &TcpGroupKey,
+    group_key: &tls::TcpGroupKey,
     listeners: &[&praxis_core::config::Listener],
     pipelines: &ListenerPipelines,
     fallback_pipeline: &Arc<ArcSwap<FilterPipeline>>,
     config: &Config,
 ) -> Service<proxy::PingoraTcpProxy> {
-    let (upstream_opt, cluster_opt, timeout_ms, max_dur_secs) = group_key;
+    let (protocol, upstream_opt, cluster_opt, timeout_ms, max_dur_secs) = group_key;
     let pipeline = listeners
         .first()
         .and_then(|l| pipelines.get(&l.name))
@@ -94,15 +95,23 @@ fn build_tcp_service(
         listener_names,
         default_listener_name,
     );
-    Service::new(tcp_service_name(upstream_opt.as_deref(), cluster_opt.as_deref()), app)
+    Service::new(
+        tcp_service_name(*protocol, upstream_opt.as_deref(), cluster_opt.as_deref()),
+        app,
+    )
 }
 
 /// Derive the Pingora service name for a TCP listener group.
-fn tcp_service_name(upstream: Option<&str>, cluster: Option<&str>) -> String {
+fn tcp_service_name(protocol: ProtocolKind, upstream: Option<&str>, cluster: Option<&str>) -> String {
+    let prefix = if protocol == ProtocolKind::H2Tunnel {
+        "h2-tunnel"
+    } else {
+        "tcp-proxy"
+    };
     match (upstream, cluster) {
-        (Some(addr), _) => format!("tcp-proxy:{addr}"),
-        (_, Some(cluster)) => format!("tcp-proxy:cluster:{cluster}"),
-        _ => "tcp-proxy:filter-routed".to_owned(),
+        (Some(addr), _) => format!("{prefix}:{addr}"),
+        (_, Some(cluster)) => format!("{prefix}:cluster:{cluster}"),
+        _ => format!("{prefix}:filter-routed"),
     }
 }
 

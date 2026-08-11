@@ -1,0 +1,31 @@
+# HTTP/2 CONNECT Tunnel (HBONE-style)
+#
+# One accepted connection carries many tunnels. The listener speaks HTTP/2,
+# and each CONNECT stream is demuxed into its own bidirectional tunnel to the
+# authority named in the request, relayed under HTTP/2 flow control. The dial
+# target comes from the stream, so the listener configures no upstream. The
+# chain's TCP filters still run per stream, so access logging, ACLs, and
+# metrics behave as they do for a raw TCP session, and the listener's
+# `tcp_session_timeout_ms` / `tcp_max_duration_secs` apply per stream too.
+#
+#   Client ──H2 CONNECT db:5432──► Praxis :15008 ──TCP──► db:5432
+#
+# Usage:
+#   cargo run -p praxis-proxy -- -c examples/configs/protocols/h2-tunnel.yaml
+#   curl --proxy http://127.0.0.1:15008 --http2-prior-knowledge http://example.invalid/
+
+insecure_options:
+  allow_private_upstreams: true
+
+listeners:
+  - name: tunnel
+    address: "127.0.0.1:15008"
+    protocol: h2_tunnel
+    filter_chains: [tunnels]
+
+filter_chains:
+  - name: tunnels
+    connection_filters:
+      - filter: h2_tunnel
+    filters:
+      - filter: tcp_access_log

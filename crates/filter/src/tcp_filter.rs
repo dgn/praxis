@@ -3,7 +3,7 @@
 
 //! The [`TcpFilter`] trait and per-connection [`TcpFilterContext`].
 
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, net::SocketAddr, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use praxis_core::{health::HealthRegistry, kv::KvStoreRegistry};
@@ -48,9 +48,12 @@ use crate::{actions::FilterAction, filter::FilterError};
 ///     cluster: None,
 ///     health_registry: None,
 ///     kv_stores: None,
+///     original_dst: None,
 ///     connect_time: Instant::now(),
 ///     bytes_in: 0,
 ///     bytes_out: 0,
+///     peer_identity: None,
+///     extensions: http::Extensions::new(),
 /// };
 /// # }
 /// ```
@@ -104,6 +107,9 @@ pub struct TcpFilterContext<'a> {
 
     /// Named key-value stores for runtime mappings.
     pub kv_stores: Option<&'a KvStoreRegistry>,
+    /// Original destination address from `SO_ORIGINAL_DST`, if the
+    /// connection was intercepted by iptables/nftables REDIRECT.
+    pub original_dst: Option<SocketAddr>,
 
     /// When the connection was accepted.
     pub connect_time: Instant,
@@ -113,6 +119,17 @@ pub struct TcpFilterContext<'a> {
 
     /// Bytes sent to client (populated after forwarding completes).
     pub bytes_out: u64,
+
+    /// Authenticated peer identity (e.g. SPIFFE URI) extracted from the
+    /// mTLS handshake, if the connection was mutually authenticated.
+    pub peer_identity: Option<&'a str>,
+
+    /// Protocol-specific metadata inserted by connection filters.
+    ///
+    /// Connection filters (e.g. `h2_tunnel`) insert typed data here
+    /// (H2 request headers, PROXY protocol fields) for sub-pipeline
+    /// filters to consume via `ctx.extensions.get::<T>()`.
+    pub extensions: http::Extensions,
 }
 
 // -----------------------------------------------------------------------------
@@ -142,9 +159,12 @@ mod tests {
             cluster: None,
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         };
         let action = filter.on_connect(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue));
@@ -161,9 +181,12 @@ mod tests {
             cluster: None,
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         };
         filter.on_disconnect(&mut ctx).await.unwrap();
     }

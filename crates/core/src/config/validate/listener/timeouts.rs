@@ -27,7 +27,9 @@ const MAX_TCP_DURATION_SECS: u64 = 86_400;
 
 /// Apply default TCP session timeout when not explicitly configured.
 pub(super) fn apply_tcp_defaults(listener: &mut Listener) {
-    if listener.protocol == ProtocolKind::Tcp && listener.tcp_session_timeout_ms.is_none() {
+    if matches!(listener.protocol, ProtocolKind::Tcp | ProtocolKind::H2Tunnel)
+        && listener.tcp_session_timeout_ms.is_none()
+    {
         debug!(
             listener = %listener.name,
             default_ms = DEFAULT_TCP_SESSION_TIMEOUT_MS,

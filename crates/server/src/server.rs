@@ -585,10 +585,13 @@ fn register_protocols(
         all_shutdowns.extend(shutdowns);
     }
 
+    // `H2` CONNECT tunnel listeners ride the TCP service: they are stream
+    // listeners whose chain declares a connection filter that frames the
+    // connection as HTTP/2, so they need no adapter of their own.
     if config
         .listeners
         .iter()
-        .any(|listener| listener.protocol == ProtocolKind::Tcp)
+        .any(|listener| matches!(listener.protocol, ProtocolKind::Tcp | ProtocolKind::H2Tunnel))
     {
         let shutdowns = Box::new(PingoraTcp).register(server, config, pipelines)?;
         all_shutdowns.extend(shutdowns);

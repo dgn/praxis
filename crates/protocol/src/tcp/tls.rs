@@ -18,21 +18,32 @@ use super::proxy::PingoraTcpProxy;
 // Types
 // -----------------------------------------------------------------------------
 
-/// Grouping key: `(upstream, cluster, idle_timeout_ms, max_duration_secs)`.
-pub(super) type TcpGroupKey = (Option<String>, Option<String>, Option<u64>, Option<u64>);
+/// Grouping key: `(protocol, upstream, cluster, idle_timeout_ms, max_duration_secs)`.
+pub(super) type TcpGroupKey = (ProtocolKind, Option<String>, Option<String>, Option<u64>, Option<u64>);
 
 // -----------------------------------------------------------------------------
 // Grouping
 // -----------------------------------------------------------------------------
 
-/// Group TCP listeners by `(upstream, cluster, idle_timeout, max_duration)`.
+/// Group stream listeners by `(protocol, upstream, cluster, idle_timeout, max_duration)`.
+///
+/// Covers both raw TCP and `H2` CONNECT tunnel listeners: a tunnel is a
+/// stream listener whose chain declares a connection filter that frames the
+/// connection, so it is served by the same [`Service`] and inherits its
+/// admission control, metrics, and TLS handling. The protocol is part of the
+/// key because it decides how the connection is framed: a tunnel listener and
+/// a raw TCP listener must never share a service, even when everything else
+/// matches.
+///
+/// [`Service`]: pingora_core::services::listening::Service
 pub(super) fn group_tcp_listeners(config: &Config) -> HashMap<TcpGroupKey, Vec<&praxis_core::config::Listener>> {
     let mut groups: HashMap<TcpGroupKey, Vec<&praxis_core::config::Listener>> = HashMap::new();
     for listener in &config.listeners {
-        if listener.protocol != ProtocolKind::Tcp {
+        if !matches!(listener.protocol, ProtocolKind::Tcp | ProtocolKind::H2Tunnel) {
             continue;
         }
         let key = (
+            listener.protocol,
             listener.upstream.clone(),
             listener.cluster.clone(),
             listener.tcp_session_timeout_ms,
@@ -49,7 +60,7 @@ pub(super) fn group_tcp_listeners(config: &Config) -> HashMap<TcpGroupKey, Vec<&
 
 /// Reject TCP groups where listeners have inconsistent settings.
 ///
-/// All listeners sharing the same `(upstream, cluster, timeout)`
+/// All listeners sharing the same `(protocol, upstream, cluster, timeout)`
 /// key are served by a single Pingora [`Service`], which uses
 /// one pipeline and one connection semaphore. Differing
 /// `filter_chains` or `max_connections` would be silently
@@ -135,10 +146,19 @@ pub(super) fn register_tcp_listeners(
     upstream: Option<&str>,
 ) -> Result<Vec<tokio::sync::watch::Sender<bool>>, ProxyError> {
     let display_upstream = upstream.unwrap_or("filter-routed");
+    // Protocol is part of the group key, so a group is homogeneous: one
+    // check covers every listener in it. A tunnel listener speaks HTTP/2
+    // over its TLS connection and must therefore negotiate ALPN, which a
+    // raw TCP forwarder must not advertise.
+    let is_tunnel = listeners
+        .first()
+        .is_some_and(|listener| listener.protocol == ProtocolKind::H2Tunnel);
+    let context_label = if is_tunnel { "H2 tunnel" } else { "TCP" };
     let mut shutdown_senders = Vec::new();
     for listener in listeners {
         if let Some(tls) = &listener.tls {
-            let (tls_settings, watcher_shutdown) = build_tcp_tls_settings(tls, &listener.address)?;
+            let (tls_settings, watcher_shutdown) =
+                crate::tls_setup::build_tls_settings(tls, &listener.address, context_label, is_tunnel)?;
             if let Some(tx) = watcher_shutdown {
                 shutdown_senders.push(tx);
             }
@@ -154,30 +174,6 @@ pub(super) fn register_tcp_listeners(
         );
     }
     Ok(shutdown_senders)
-}
-
-// -----------------------------------------------------------------------------
-// TLS
-// -----------------------------------------------------------------------------
-
-/// Build [`TlsSettings`] for a TCP listener.
-///
-/// Delegates to the shared [`build_tls_settings`] with a `"TCP"`
-/// context label.
-///
-/// [`TlsSettings`]: pingora_core::listeners::tls::TlsSettings
-/// [`build_tls_settings`]: crate::tls_setup::build_tls_settings
-fn build_tcp_tls_settings(
-    tls: &praxis_tls::ListenerTls,
-    address: &str,
-) -> Result<
-    (
-        pingora_core::listeners::tls::TlsSettings,
-        Option<tokio::sync::watch::Sender<bool>>,
-    ),
-    ProxyError,
-> {
-    crate::tls_setup::build_tls_settings(tls, address, "TCP", false)
 }
 
 // -----------------------------------------------------------------------------
@@ -211,7 +207,13 @@ listeners:
         let groups = group_tcp_listeners(&config);
         assert_eq!(groups.len(), 1, "same upstream + timeout should produce one group");
         let default_timeout = config.listeners[0].tcp_session_timeout_ms;
-        let key = (Some("10.0.0.1:5432".to_owned()), None, default_timeout, None);
+        let key = (
+            ProtocolKind::Tcp,
+            Some("10.0.0.1:5432".to_owned()),
+            None,
+            default_timeout,
+            None,
+        );
         assert_eq!(groups[&key].len(), 2, "both listeners should be in the same group");
     }
 
@@ -323,7 +325,7 @@ listeners:
             .find(|l| l.protocol == ProtocolKind::Tcp)
             .unwrap()
             .tcp_session_timeout_ms;
-        let key = (Some("10.0.0.1:5432".to_owned()), None, timeout, None);
+        let key = (ProtocolKind::Tcp, Some("10.0.0.1:5432".to_owned()), None, timeout, None);
         assert!(groups.contains_key(&key), "only TCP listener should be grouped");
     }
 
@@ -336,8 +338,24 @@ listeners:
             1,
             "TCP listener without upstream should be grouped with None key"
         );
-        let key = (None, None, None, None);
+        let key = (ProtocolKind::Tcp, None, None, None, None);
         assert!(groups.contains_key(&key), "group key should have None upstream");
+    }
+
+    #[test]
+    fn group_tcp_listeners_separates_tunnel_from_tcp_listeners() {
+        let config = tunnel_and_tcp_config();
+        let groups = group_tcp_listeners(&config);
+        assert_eq!(
+            groups.len(),
+            2,
+            "a tunnel listener and a TCP listener must not share a service, even with identical settings"
+        );
+        let tunnel_group = groups
+            .iter()
+            .find(|(key, _)| key.0 == ProtocolKind::H2Tunnel)
+            .expect("one group should be the tunnel listener");
+        assert_eq!(tunnel_group.1.len(), 1, "the tunnel group holds only its listener");
     }
 
     #[test]
@@ -562,11 +580,38 @@ insecure_options:
         }
     }
 
+    /// Build a Config with one TCP and one `H2` tunnel listener that are
+    /// otherwise identical, to prove the protocol alone splits them into
+    /// separate services.
+    fn tunnel_and_tcp_config() -> Config {
+        Config::from_yaml(
+            r#"
+listeners:
+  - name: db
+    address: "0.0.0.0:5432"
+    protocol: tcp
+    upstream: "10.0.0.1:5432"
+  - name: tunnel
+    address: "0.0.0.0:15008"
+    protocol: h2_tunnel
+    upstream: "10.0.0.1:5432"
+    filter_chains: [tunnels]
+filter_chains:
+  - name: tunnels
+    connection_filters:
+      - filter: h2_tunnel
+    filters:
+      - filter: tcp_access_log
+"#,
+        )
+        .unwrap()
+    }
+
     /// Wrap listeners into a single-group map.
     fn make_group(
         listeners: Vec<praxis_core::config::Listener>,
     ) -> HashMap<TcpGroupKey, Vec<praxis_core::config::Listener>> {
-        let key = (Some("10.0.0.1:5432".to_owned()), None, None, None);
+        let key = (ProtocolKind::Tcp, Some("10.0.0.1:5432".to_owned()), None, None, None);
         let mut groups = HashMap::new();
         groups.insert(key, listeners);
         groups

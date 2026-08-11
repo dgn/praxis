@@ -153,7 +153,7 @@ pub struct Listener {
 /// let kind: ProtocolKind = serde_yaml::from_str("http").unwrap();
 /// assert_eq!(kind, ProtocolKind::Http);
 /// ```
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProtocolKind {
     /// HTTP (default).
@@ -163,6 +163,12 @@ pub enum ProtocolKind {
     /// Raw TCP / L4 forwarding. Requires an `upstream` address
     /// unless filter chains provide routing (e.g. via `sni_router`).
     Tcp,
+
+    /// `H2` CONNECT tunnel. Accepts HTTP/2 connections and demuxes
+    /// CONNECT requests into bidirectional byte tunnels, each processed
+    /// through the TCP filter pipeline.
+    #[serde(rename = "h2_tunnel")]
+    H2Tunnel,
 }
 
 impl ProtocolKind {
@@ -180,7 +186,7 @@ impl ProtocolKind {
     /// ```
     pub fn stack(self) -> &'static [ProtocolKind] {
         match self {
-            Self::Tcp => &[ProtocolKind::Tcp],
+            Self::Tcp | Self::H2Tunnel => &[ProtocolKind::Tcp],
             Self::Http => &[ProtocolKind::Tcp, ProtocolKind::Http],
         }
     }
@@ -441,5 +447,34 @@ cluster: db_pool
         let yaml = "name: test\naddress: \"0.0.0.0:8080\"";
         let listener: Listener = serde_yaml::from_str(yaml).unwrap();
         assert!(listener.cluster.is_none(), "cluster should default to None");
+    }
+
+    #[test]
+    fn parse_h2_tunnel_listener() {
+        let yaml = "name: tunnel\naddress: \"0.0.0.0:15008\"\nprotocol: h2_tunnel\nfilter_chains: [hbone]";
+        let listener: Listener = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(listener.protocol, ProtocolKind::H2Tunnel, "protocol should be H2Tunnel");
+    }
+
+    #[test]
+    fn protocol_stack_h2_tunnel() {
+        let stack = ProtocolKind::H2Tunnel.stack();
+        assert_eq!(stack, &[ProtocolKind::Tcp], "H2Tunnel stack should contain only Tcp");
+    }
+
+    #[test]
+    fn h2_tunnel_supports_tcp_filters() {
+        assert!(
+            ProtocolKind::H2Tunnel.supports(ProtocolKind::Tcp),
+            "H2Tunnel should support TCP filters"
+        );
+    }
+
+    #[test]
+    fn h2_tunnel_does_not_support_http_filters() {
+        assert!(
+            !ProtocolKind::H2Tunnel.supports(ProtocolKind::Http),
+            "H2Tunnel should not support HTTP filters"
+        );
     }
 }

@@ -455,6 +455,7 @@ fn build_config(address: &str, clusters: Vec<Cluster>, filters: Vec<FilterEntry>
         filter_chains: vec![FilterChainConfig {
             name: "backend".to_owned(),
             conditions: Vec::new(),
+            connection_filters: vec![],
             filters,
         }],
         insecure_options: InsecureOptions::default(),

@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 
 use crate::{
     any_filter::AnyFilter,
+    connection_filter::ConnectionFilter,
     filter::{FilterError, HttpFilter},
     tcp_filter::TcpFilter,
 };
@@ -109,11 +110,18 @@ pub type HttpFilterFactory = Arc<dyn Fn(&serde_yaml::Value) -> Result<Box<dyn Ht
 /// Factory function for creating TCP filters from config.
 pub type TcpFilterFactory = Arc<dyn Fn(&serde_yaml::Value) -> Result<Box<dyn TcpFilter>, FilterError> + Send + Sync>;
 
+/// Factory function for creating connection filters from config.
+pub type ConnectionFilterFactory =
+    Arc<dyn Fn(&serde_yaml::Value) -> Result<Box<dyn ConnectionFilter>, FilterError> + Send + Sync>;
+
 /// Bare function-pointer factory for a built-in HTTP filter.
 pub(crate) type HttpFilterFactoryFn = fn(&serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError>;
 
 /// Bare function-pointer factory for a built-in TCP filter.
 pub(crate) type TcpFilterFactoryFn = fn(&serde_yaml::Value) -> Result<Box<dyn TcpFilter>, FilterError>;
+
+/// Bare function-pointer factory for a built-in connection filter.
+pub(crate) type ConnectionFilterFactoryFn = fn(&serde_yaml::Value) -> Result<Box<dyn ConnectionFilter>, FilterError>;
 
 // -----------------------------------------------------------------------------
 // FilterFactory
@@ -127,14 +135,40 @@ pub enum FilterFactory {
 
     /// Factory for TCP-level filters.
     Tcp(TcpFilterFactory),
+
+    /// Factory for connection-level filters.
+    ///
+    /// Connection filters take over the raw stream, so they are not
+    /// `AnyFilter`s and are built through
+    /// [`FilterRegistry::create_connection`](crate::FilterRegistry::create_connection)
+    /// from a chain's `connection_filters` list.
+    Connection(ConnectionFilterFactory),
 }
 
 impl FilterFactory {
-    /// Create a filter from YAML config.
+    /// Create an HTTP or TCP filter from YAML config.
+    ///
+    /// Connection filters must be built with [`create_connection`](Self::create_connection).
     pub(crate) fn create(&self, config: &serde_yaml::Value) -> Result<AnyFilter, FilterError> {
         match self {
             Self::Http(f) => Ok(AnyFilter::Http(f(config)?)),
             Self::Tcp(f) => Ok(AnyFilter::Tcp(f(config)?)),
+            Self::Connection(_) => Err("connection filters must be placed in connection_filters, not filters".into()),
+        }
+    }
+
+    /// Create a connection filter from YAML config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if this factory is not a connection filter.
+    pub(crate) fn create_connection(
+        &self,
+        config: &serde_yaml::Value,
+    ) -> Result<Box<dyn ConnectionFilter>, FilterError> {
+        match self {
+            Self::Connection(f) => f(config),
+            _ => Err("filter is not a connection filter; place it in filters, not connection_filters".into()),
         }
     }
 }
@@ -171,6 +205,21 @@ pub fn http_builtin(f: HttpFilterFactoryFn) -> FilterFactory {
 /// ```
 pub fn tcp_builtin(f: TcpFilterFactoryFn) -> FilterFactory {
     FilterFactory::Tcp(Arc::new(f))
+}
+
+/// Wrap a builtin connection filter factory function.
+///
+/// ```
+/// use praxis_filter::{ConnectionFilter, FilterError, FilterFactory, connection_builtin};
+///
+/// fn my_factory(_: &serde_yaml::Value) -> Result<Box<dyn ConnectionFilter>, FilterError> {
+///     unimplemented!()
+/// }
+///
+/// let _factory: FilterFactory = connection_builtin(my_factory);
+/// ```
+pub fn connection_builtin(f: ConnectionFilterFactoryFn) -> FilterFactory {
+    FilterFactory::Connection(Arc::new(f))
 }
 
 // -----------------------------------------------------------------------------

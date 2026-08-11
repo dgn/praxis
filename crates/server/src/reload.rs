@@ -207,6 +207,9 @@ fn reject_protocol_changes(
 
 /// Reject reloads that change what a bound TCP listener captured at startup.
 ///
+/// `H2` CONNECT tunnel listeners are stream listeners served by the same
+/// group service, so they are covered identically.
+///
 /// A TCP listener group's Pingora service captures its upstream, cluster,
 /// timeouts, and `allow_private_upstreams` by value when it is built, and
 /// reads the pipeline slot of the group's first listener only. Changing
@@ -222,7 +225,7 @@ fn reject_tcp_group_changes(
     let mut old_tcp = old_config
         .listeners
         .iter()
-        .filter(|listener| listener.protocol == ProtocolKind::Tcp)
+        .filter(|listener| matches!(listener.protocol, ProtocolKind::Tcp | ProtocolKind::H2Tunnel))
         .peekable();
     if old_tcp.peek().is_some()
         && old_config.insecure_options.allow_private_upstreams != new_config.insecure_options.allow_private_upstreams
@@ -234,7 +237,7 @@ fn reject_tcp_group_changes(
         let Some(new) = new_config.listeners.iter().find(|listener| listener.name == old.name) else {
             return Err(format!("TCP listener '{name}' removed; TCP listener topology requires a restart").into());
         };
-        if new.protocol != ProtocolKind::Tcp {
+        if !matches!(new.protocol, ProtocolKind::Tcp | ProtocolKind::H2Tunnel) {
             continue;
         }
         if tcp_group_key(old) != tcp_group_key(new) {

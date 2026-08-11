@@ -679,9 +679,12 @@ default_upstream: "10.0.0.1:443"
             cluster: None,
             health_registry: None,
             kv_stores: None,
+            original_dst: None,
             connect_time: Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+            peer_identity: None,
+            extensions: http::Extensions::new(),
         }
     }
 }

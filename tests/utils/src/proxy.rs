@@ -426,7 +426,14 @@ fn build_full_server_with_registry(config: &Config, registry: &FilterRegistry) -
             .expect("HTTP protocol registration should succeed in test");
     }
 
-    if config.listeners.iter().any(|l| l.protocol == ProtocolKind::Tcp) {
+    // H2 tunnel listeners ride the TCP service, as in the server's own
+    // registration: they are stream listeners whose connection filter frames
+    // the connection as HTTP/2.
+    if config
+        .listeners
+        .iter()
+        .any(|l| matches!(l.protocol, ProtocolKind::Tcp | ProtocolKind::H2Tunnel))
+    {
         let _ = Box::new(PingoraTcp)
             .register(&mut runtime, config, &pipelines)
             .expect("TCP protocol registration should succeed in test");
