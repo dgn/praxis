@@ -510,6 +510,14 @@ pub struct HttpFilterContext<'a> {
     /// This avoids duplicating connection config across filters.
     pub pinned_endpoint_address: Option<Arc<str>>,
 
+    /// Ordered cluster names walked by health-based failover, from the
+    /// originally routed cluster through the effective cluster serving the
+    /// request, inclusive of both. `Some` (with at least two entries) only
+    /// after a failover; the load balancer resets it to `None` at the start
+    /// of each selection.
+    #[cfg(feature = "health-based-failover")]
+    pub fallback_chain: Option<Arc<[Arc<str>]>>,
+
     /// Wall-clock time source for timestamp generation.
     pub time_source: &'a dyn TimeSource,
 
@@ -553,6 +561,15 @@ impl HttpFilterContext<'_> {
     /// Upstream peer address, if selected.
     pub fn upstream_addr(&self) -> Option<&str> {
         self.upstream.as_ref().map(|u| &*u.address)
+    }
+
+    /// Rendered access-log value for the health-based-failover chain:
+    /// walked cluster names joined by `,` (routed first, effective last)
+    /// when failover occurred, `-` otherwise.
+    #[cfg(feature = "health-based-failover")]
+    #[must_use]
+    pub fn fallback_chain_field(&self) -> String {
+        crate::load_balancing::failover::render_chain(self.fallback_chain.as_deref())
     }
 
     /// Cap the live streaming body's next per-chunk read at `timeout`.
@@ -1510,6 +1527,36 @@ mod tests {
         let req = crate::test_utils::make_request(Method::GET, "/");
         let ctx = crate::test_utils::make_filter_context(&req);
         assert!(ctx.cluster_name().is_none(), "cluster name should be None when unset");
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn fallback_chain_field_renders_dash_without_failover() {
+        let req = crate::test_utils::make_request(Method::GET, "/");
+        let ctx = crate::test_utils::make_filter_context(&req);
+        assert_eq!(ctx.fallback_chain_field(), "-", "no failover should render '-'");
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn fallback_chain_field_renders_joined_chain_after_failover() {
+        let req = crate::test_utils::make_request(Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.fallback_chain = Some(Arc::from(vec![Arc::<str>::from("primary"), Arc::<str>::from("backup")]));
+        assert_eq!(ctx.fallback_chain_field(), "primary,backup");
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn fallback_chain_field_renders_dash_for_single_hop_chain() {
+        let req = crate::test_utils::make_request(Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.fallback_chain = Some(Arc::from(vec![Arc::<str>::from("primary")]));
+        assert_eq!(
+            ctx.fallback_chain_field(),
+            "-",
+            "a single-element chain means no failover occurred"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ publish = false
 spiffe = ["praxis-core/spiffe"]
 upstream-binding = ["praxis-core/upstream-binding"]
 cloud-events-filter = ["praxis-filter/cloud-events-filter"]
+health-based-failover = ["praxis-core/health-based-failover"]
 
 [lints]
 workspace = true

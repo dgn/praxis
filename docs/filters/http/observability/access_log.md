@@ -10,7 +10,7 @@ Logs structured access records for each request and response.
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `sample_rate` | number | no | Fraction of requests to log (0.0, 1.0]. Defaults to 1.0. |
-| `fields` | any[] | no | Scalar field tokens; replaces the default ten when present. |
+| `fields` | any[] | no | Scalar field tokens; replaces the default ten fields when present (eleven with `health-based-failover`, which adds `fallback_chain`). |
 | `request_headers` | string[] | no | Request header names allowed for `request_header.<name>` tokens. |
 | `response_headers` | string[] | no | Response header names allowed for `response_header.<name>` tokens. |
 | `conditions` | AccessLogEmitConditions | no | Emit-time conditions (AND across keys). |
@@ -23,7 +23,7 @@ Logs structured access records for each request and response.
 ```yaml
 filter: access_log
 sample_rate: 0.1   # optional; log ~10% of requests (default 1.0)
-fields:            # optional; replaces default ten fields when present
+fields:            # optional; replaces the default field set when present
   - method
   - path
   - status

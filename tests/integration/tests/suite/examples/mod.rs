@@ -38,6 +38,8 @@ mod grpc_web;
 mod guardrails;
 mod guardrails_per_model;
 mod header_manipulation;
+#[cfg(feature = "health-based-failover")]
+mod health_based_failover;
 mod health_checks;
 mod hostname_upstream;
 mod http_active_requests;

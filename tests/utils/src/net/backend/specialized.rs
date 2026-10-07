@@ -220,6 +220,73 @@ fn serve_then_kill_connection(mut stream: TcpStream, connection_num: usize, log:
 }
 
 // -----------------------------------------------------------------------------
+// Health Toggle Backend
+// -----------------------------------------------------------------------------
+
+/// A backend whose health-check answer can be flipped mid-test.
+///
+/// Requests for the health path answer `200` while healthy and `503`
+/// otherwise. Every other request answers `200` with the backend's body even
+/// while unhealthy, so a request the proxy still routes here (e.g. in panic
+/// mode) succeeds and names the backend that served it.
+pub struct HealthToggleBackend {
+    /// Shuts the listener down on drop.
+    guard: BackendGuard,
+
+    /// Whether the health path currently passes.
+    healthy: Arc<AtomicBool>,
+}
+
+impl HealthToggleBackend {
+    /// The allocated port number.
+    pub fn port(&self) -> u16 {
+        self.guard.port()
+    }
+
+    /// Whether the health path currently passes.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    /// Make the health path pass or fail from the next probe on.
+    pub fn set_healthy(&self, healthy: bool) {
+        self.healthy.store(healthy, Ordering::Release);
+    }
+}
+
+/// Start a healthy [`HealthToggleBackend`] that answers `health_path` with its
+/// health and every other path with `body`.
+///
+/// # Panics
+///
+/// Panics if the server fails to bind.
+pub fn start_health_toggle_backend(health_path: &str, body: &str) -> HealthToggleBackend {
+    let healthy = Arc::new(AtomicBool::new(true));
+    let flag = Arc::clone(&healthy);
+    let health_path = health_path.to_owned();
+    let body = body.to_owned();
+
+    let guard = spawn_tcp_server_with_shutdown(move |mut stream| {
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let request = read_until_headers_complete(&mut stream);
+        let is_probe = request.split_whitespace().nth(1) == Some(health_path.as_str());
+        let (status, reply) = match (is_probe, flag.load(Ordering::Acquire)) {
+            (false, _) => (200, body.as_str()),
+            (true, true) => (200, "healthy"),
+            (true, false) => (503, "unhealthy"),
+        };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{reply}",
+            reason = super::simple::reason_phrase(status),
+            len = reply.len(),
+        );
+        let _sent = stream.write_all(response.as_bytes());
+    });
+
+    HealthToggleBackend { guard, healthy }
+}
+
+// -----------------------------------------------------------------------------
 // Shared TCP Server Utilities
 // -----------------------------------------------------------------------------
 

@@ -46,6 +46,8 @@ use crate::{actions::FilterAction, filter::FilterError};
 ///     sni: None,
 ///     upstream_addr: Some(Cow::Borrowed("10.0.0.1:80")),
 ///     cluster: None,
+/// #     #[cfg(feature = "health-based-failover")]
+/// #     fallback_chain: None,
 ///     health_registry: None,
 ///     kv_stores: None,
 ///     connect_time: Instant::now(),
@@ -69,6 +71,16 @@ pub trait TcpFilter: Send + Sync {
     async fn on_disconnect(&self, ctx: &mut TcpFilterContext<'_>) -> Result<(), FilterError> {
         let _ = ctx;
         Ok(())
+    }
+
+    /// The `fallback_cluster` targets this filter can fail over to.
+    ///
+    /// `tcp_load_balancer` overrides this so pipeline validation can
+    /// require `tcp_access_log` to run after a load balancer that may fail
+    /// over.
+    #[cfg(feature = "health-based-failover")]
+    fn fallback_clusters(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -96,8 +108,18 @@ pub struct TcpFilterContext<'a> {
     /// Cluster name selected for this connection.
     ///
     /// Set by the listener config when `cluster` is configured.
-    /// Read by `tcp_load_balancer` to look up the strategy.
+    /// Read by `tcp_load_balancer` to look up the strategy. After a
+    /// health-based failover, `tcp_load_balancer` overwrites it with the
+    /// effective cluster.
     pub cluster: Option<Arc<str>>,
+
+    /// Ordered cluster names actually walked for this connection, from the
+    /// originally routed cluster through the effective cluster, inclusive
+    /// of both. `Some` (with at least two entries) only after a failover;
+    /// `tcp_load_balancer` resets it to `None` at the start of each
+    /// selection. Read by `tcp_access_log`.
+    #[cfg(feature = "health-based-failover")]
+    pub fallback_chain: Option<Arc<[Arc<str>]>>,
 
     /// Shared health registry for endpoint health lookups.
     pub health_registry: Option<&'a HealthRegistry>,
@@ -113,6 +135,17 @@ pub struct TcpFilterContext<'a> {
 
     /// Bytes sent to client (populated after forwarding completes).
     pub bytes_out: u64,
+}
+
+#[cfg(feature = "health-based-failover")]
+impl TcpFilterContext<'_> {
+    /// Rendered access-log value for the health-based-failover chain:
+    /// walked cluster names joined by `,` (routed first, effective last)
+    /// when failover occurred, `-` otherwise.
+    #[must_use]
+    pub fn fallback_chain_field(&self) -> String {
+        crate::load_balancing::failover::render_chain(self.fallback_chain.as_deref())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -140,6 +173,8 @@ mod tests {
             sni: None,
             upstream_addr: Some(Cow::Borrowed("10.0.0.1:5432")),
             cluster: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: None,
             kv_stores: None,
             connect_time: Instant::now(),
@@ -159,6 +194,8 @@ mod tests {
             sni: None,
             upstream_addr: Some(Cow::Borrowed("10.0.0.1:5432")),
             cluster: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: None,
             kv_stores: None,
             connect_time: Instant::now(),
@@ -166,6 +203,44 @@ mod tests {
             bytes_out: 0,
         };
         filter.on_disconnect(&mut ctx).await.unwrap();
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn fallback_chain_field_renders_dash_without_failover() {
+        let ctx = TcpFilterContext {
+            remote_addr: "127.0.0.1:12345",
+            local_addr: "0.0.0.0:5432",
+            sni: None,
+            upstream_addr: None,
+            cluster: None,
+            fallback_chain: None,
+            health_registry: None,
+            kv_stores: None,
+            connect_time: Instant::now(),
+            bytes_in: 0,
+            bytes_out: 0,
+        };
+        assert_eq!(ctx.fallback_chain_field(), "-");
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn fallback_chain_field_renders_joined_chain_after_failover() {
+        let ctx = TcpFilterContext {
+            remote_addr: "127.0.0.1:12345",
+            local_addr: "0.0.0.0:5432",
+            sni: None,
+            upstream_addr: None,
+            cluster: None,
+            fallback_chain: Some(Arc::from(vec![Arc::<str>::from("primary"), Arc::<str>::from("backup")])),
+            health_registry: None,
+            kv_stores: None,
+            connect_time: Instant::now(),
+            bytes_in: 0,
+            bytes_out: 0,
+        };
+        assert_eq!(ctx.fallback_chain_field(), "primary,backup");
     }
 
     // -------------------------------------------------------------------------

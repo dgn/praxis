@@ -72,6 +72,14 @@ bound-upstream-request-body = ["praxis-filter/bound-upstream-request-body", "exp
 chain-binding = ["praxis-filter/chain-binding", "experimental"]
 # SPIFFE X.509-SVID mTLS peer identity. Off by default; experimental.
 spiffe = ["praxis-protocol/spiffe", "praxis-filter/spiffe", "experimental"]
+# Per-cluster health-based failover (`fallback_cluster`). Off by default;
+# experimental.
+health-based-failover = [
+    "praxis-core/health-based-failover",
+    "praxis-filter/health-based-failover",
+    "praxis-protocol/health-based-failover",
+    "experimental",
+]
 # The `policy` filter (Praxis Policy Engine). On by default. The workspace
 # declares praxis-filter with `default-features = false`, so this feature is
 # the only thing that turns the filter's `policy-engine` on; a

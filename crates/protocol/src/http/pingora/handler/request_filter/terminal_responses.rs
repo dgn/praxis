@@ -15,7 +15,7 @@ use tracing::{debug, error, warn};
 
 use super::super::{
     super::{
-        context::PingoraRequestCtx,
+        context::{PingoraRequestCtx, take_fallback_chain, write_back_fallback_chain},
         convert::{send_rejection, send_rejection_for},
     },
     body_util::clamp_body_mode_to_ceiling,
@@ -84,6 +84,7 @@ async fn prepare_terminal_response(
         result,
         response_body_mode,
         cluster,
+        fallback_chain,
         upstream,
         extensions,
         filter_metadata,
@@ -98,10 +99,12 @@ async fn prepare_terminal_response(
             .filter_context_for(pipeline, Some(&mut resp))
             .expect("request snapshot checked above");
         let result = pipeline.execute_http_response(&mut fctx).await;
+        let fallback_chain = take_fallback_chain(&mut fctx);
         (
             result,
             fctx.response_body_mode,
             fctx.cluster,
+            fallback_chain,
             fctx.upstream,
             fctx.extensions,
             fctx.filter_metadata,
@@ -114,6 +117,7 @@ async fn prepare_terminal_response(
         )
     };
     ctx.cluster = cluster;
+    write_back_fallback_chain(ctx, fallback_chain);
     ctx.upstream = upstream;
     ctx.extensions = extensions;
     ctx.filter_metadata = filter_metadata;
@@ -151,6 +155,7 @@ fn run_parent_terminal_body_filters(
         result,
         response_body_bytes,
         cluster,
+        fallback_chain,
         upstream,
         extensions,
         filter_metadata,
@@ -166,10 +171,12 @@ fn run_parent_terminal_body_filters(
             return Ok(());
         };
         let r = pipeline.execute_http_response_body_with_response_header(&mut fctx, body, end_of_stream, Some(resp));
+        let fallback_chain = take_fallback_chain(&mut fctx);
         (
             r,
             fctx.response_body_bytes,
             fctx.cluster,
+            fallback_chain,
             fctx.upstream,
             fctx.extensions,
             fctx.filter_metadata,
@@ -183,6 +190,7 @@ fn run_parent_terminal_body_filters(
     };
     ctx.response_body_bytes = response_body_bytes;
     ctx.cluster = cluster;
+    write_back_fallback_chain(ctx, fallback_chain);
     ctx.upstream = upstream;
     ctx.extensions = extensions;
     ctx.filter_metadata = filter_metadata;

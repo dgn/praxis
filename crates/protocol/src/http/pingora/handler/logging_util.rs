@@ -12,7 +12,7 @@
 
 use praxis_filter::FilterPipeline;
 
-use crate::http::pingora::context::PingoraRequestCtx;
+use crate::http::pingora::context::{PingoraRequestCtx, take_fallback_chain, write_back_fallback_chain};
 
 /// Emit a fallback access record for requests whose lifecycle ended
 /// before the access log filter's completion hooks could run.
@@ -62,15 +62,16 @@ pub(super) async fn logging_cleanup(pipeline: &FilterPipeline, ctx: &mut Pingora
         && let Some(mut filter_ctx) = ctx.filter_context_for(pipeline, None)
     {
         let _result = pipeline.execute_http_response(&mut filter_ctx).await;
+        let fallback_chain = take_fallback_chain(&mut filter_ctx);
         let extensions = filter_ctx.extensions;
         let metadata = filter_ctx.filter_metadata;
         let state = filter_ctx.filter_state;
         let branch_idx = filter_ctx.executed_branch_filters;
         let exec_idx = filter_ctx.executed_filter_indices;
         let body_idx = filter_ctx.body_done_indices;
-        // The context macro takes cluster/upstream out of ctx; restore them
-        // so the fallback access record that follows can attribute the
-        // failure to the routed cluster and selected endpoint.
+        // The context macro takes cluster/upstream/fallback_chain out of ctx;
+        // restore them so the fallback access record that follows can
+        // attribute the failure to the routed cluster and selected endpoint.
         let cluster = filter_ctx.cluster;
         let upstream = filter_ctx.upstream;
         ctx.extensions = extensions;
@@ -80,6 +81,7 @@ pub(super) async fn logging_cleanup(pipeline: &FilterPipeline, ctx: &mut Pingora
         ctx.cached_executed_filter_indices = exec_idx;
         ctx.cached_body_done_indices = body_idx;
         ctx.cluster = cluster;
+        write_back_fallback_chain(ctx, fallback_chain);
         ctx.upstream = upstream;
     }
 }

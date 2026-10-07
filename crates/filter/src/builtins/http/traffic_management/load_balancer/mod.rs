@@ -31,6 +31,8 @@ use tracing::{debug, warn};
 
 use self::entry::{ClusterEntry, build_cluster_entry};
 pub use self::reselector::EndpointReselector;
+#[cfg(feature = "health-based-failover")]
+use crate::load_balancing::failover::{self, FailoverSelection};
 #[cfg(feature = "upstream-binding")]
 use crate::pipeline::catalog::{ClusterApplicationMetadata, ClusterMetadataDeclaration};
 use crate::{
@@ -55,6 +57,14 @@ use crate::{
 ///   requests to a stable endpoint.
 /// - `maglev`: hashes a configurable request header (or the URI path) through a Maglev lookup table for even
 ///   distribution and minimal disruption when endpoints change.
+///
+/// With the `health-based-failover` build feature, an inline cluster may also
+/// set `fallback_cluster` to another cluster in this filter's local
+/// `clusters:` list. When every endpoint in the routed cluster is unhealthy,
+/// the load balancer walks that chain until it finds the first healthy cluster
+/// or reaches the terminal cluster's panic mode. Every fallback-chain member
+/// must have a matching top-level health declaration with the same endpoint
+/// set; see `docs/operating/health-checking.md`.
 ///
 /// # YAML configuration
 ///
@@ -266,7 +276,53 @@ impl LoadBalancerFilter {
     fn cluster_health<'a>(registry: Option<&'a HealthRegistry>, cluster_name: &str) -> Option<&'a ClusterHealthState> {
         registry.and_then(|r| r.get(cluster_name))
     }
+
+    /// Walk the fallback chain from the `routed` cluster.
+    ///
+    /// Clears any chain left by an earlier selection. On failover, points
+    /// [`HttpFilterContext::cluster`] at the effective cluster, records the
+    /// walked chain, drops any endpoint pinned against the routed cluster,
+    /// and returns the effective cluster with the [`FailoverSelection`];
+    /// otherwise returns `routed` unchanged.
+    #[cfg(feature = "health-based-failover")]
+    fn resolve_failover<'a>(
+        &'a self,
+        routed: ResolvedCluster<'a>,
+        ctx: &mut HttpFilterContext<'_>,
+    ) -> Result<(ResolvedCluster<'a>, Option<FailoverSelection>), FilterError> {
+        ctx.fallback_chain = None;
+        let registry = ctx.health_registry;
+        let Some(selection) = failover::walk(
+            routed.0,
+            |name| Self::cluster_health(registry, name).is_some_and(|health| health.all_unhealthy()),
+            |name| self.clusters.get(name).and_then(|entry| entry.fallback_cluster.clone()),
+        )?
+        else {
+            return Ok((routed, None));
+        };
+        let effective = selection.effective_cluster();
+        let resolved = self
+            .clusters
+            .get_key_value(effective.as_ref())
+            .ok_or_else(|| -> FilterError {
+                format!("load_balancer filter: fallback cluster '{effective}' not declared in this load_balancer")
+                    .into()
+            })?;
+        debug!(
+            routed = %selection.routed_cluster(),
+            effective = %effective,
+            "cluster unhealthy, routing to fallback chain"
+        );
+        ctx.cluster = Some(Arc::clone(resolved.0));
+        ctx.fallback_chain = Some(Arc::clone(selection.chain()));
+        ctx.pinned_endpoint_address = None;
+        Ok((resolved, Some(selection)))
+    }
 }
+
+/// A resolved cluster: its interned name and load-balancer entry.
+#[cfg(feature = "health-based-failover")]
+type ResolvedCluster<'a> = (&'a Arc<str>, &'a ClusterEntry);
 
 #[async_trait]
 #[expect(
@@ -280,6 +336,14 @@ impl HttpFilter for LoadBalancerFilter {
 
     fn load_balancer_clusters(&self) -> Vec<String> {
         self.clusters.keys().map(ToString::to_string).collect()
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    fn fallback_clusters(&self) -> Vec<String> {
+        self.clusters
+            .values()
+            .filter_map(|entry| entry.fallback_cluster.as_deref().map(str::to_owned))
+            .collect()
     }
 
     #[cfg(feature = "upstream-binding")]
@@ -329,7 +393,10 @@ impl HttpFilter for LoadBalancerFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let (cluster, entry) = self.resolve_cluster(ctx)?;
+        let resolved = self.resolve_cluster(ctx)?;
+        #[cfg(feature = "health-based-failover")]
+        let (resolved, fallback_selection) = self.resolve_failover(resolved, ctx)?;
+        let (cluster, entry) = resolved;
         let cluster_name = cluster.as_ref();
 
         let health = Self::cluster_health(ctx.health_registry, cluster_name);
@@ -378,6 +445,11 @@ impl HttpFilter for LoadBalancerFilter {
             format!("load_balancer filter: cluster '{cluster_name}' has no available endpoints").into()
         })?;
         debug!(cluster = %cluster_name, upstream = %addr, "upstream selected");
+
+        #[cfg(feature = "health-based-failover")]
+        if let Some(selection) = &fallback_selection {
+            selection.record_hops();
+        }
 
         ctx.selected_endpoint_index = health.and_then(|h| h.endpoint_index(&addr)).or(Some(usize::MAX));
         ctx.set_metadata("lb.selected", "true");

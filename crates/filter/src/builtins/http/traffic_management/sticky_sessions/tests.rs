@@ -416,3 +416,297 @@ fn find_request_cookie_checks_all_cookie_headers() {
         "cookie lookup must consider every Cookie header"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Health-Based Failover
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "health-based-failover")]
+mod failover {
+    //! `sticky_sessions` in front of a `load_balancer` whose two-endpoint
+    //! `primary` cluster falls back to `backup`.
+
+    #![expect(clippy::expect_used, reason = "tests")]
+
+    use praxis_core::health::HealthRegistry;
+
+    use super::*;
+    use crate::{FilterPipeline, FilterRegistry, test_utils::multi_health_registry};
+
+    const P1: &str = "10.0.0.1:80";
+    const P2: &str = "10.0.0.2:80";
+    const BACKUP: &str = "10.0.1.1:80";
+
+    #[tokio::test]
+    async fn cookie_failover_keeps_the_primary_cookie_for_recovery() {
+        let harness = Harness::new(
+            "
+    - { name: primary, type: cookie, cookie_name: _praxis_primary, failover: false }
+    - { name: backup, type: cookie, cookie_name: _praxis_backup }",
+        );
+        let key = harness
+            .exchange(&health(&[]), &[], None)
+            .await
+            .pinned_on_primary("_praxis_primary");
+        let primary_cookie = format!("_praxis_primary={key}");
+
+        let failover = harness
+            .exchange(&health(&[0, 1]), &[("cookie", &primary_cookie)], None)
+            .await;
+
+        failover.assert_served_by_backup();
+        assert_eq!(
+            failover.cookie("_praxis_primary"),
+            None,
+            "the client keeps its primary session"
+        );
+        let backup_key = failover
+            .cookie("_praxis_backup")
+            .expect("the fallback mints its own session");
+        harness.assert_failover_bindings(&key, &backup_key);
+        let cookies = format!("{primary_cookie}; _praxis_backup={backup_key}");
+        let recovered = harness.exchange(&health(&[]), &[("cookie", &cookies)], None).await;
+        assert_eq!(
+            recovered.served, P1,
+            "recovery reuses the primary cluster's original mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn header_failover_pins_the_fallback_store_and_recovers_the_primary_mapping() {
+        let harness = Harness::new(
+            "
+    - { name: primary, type: header, header_name: x-session-id }
+    - { name: backup, type: header, header_name: x-session-id }",
+        );
+        let session = [("x-session-id", "client-1")];
+        assert_eq!(harness.exchange(&health(&[]), &session, None).await.served, P1);
+
+        harness
+            .exchange(&health(&[0, 1]), &session, None)
+            .await
+            .assert_served_by_backup();
+
+        harness.assert_failover_bindings("client-1", "client-1");
+        let recovered = harness.exchange(&health(&[]), &session, None).await;
+        assert_eq!(
+            recovered.served, P1,
+            "recovery reuses the primary cluster's original mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn learn_failover_pins_the_fallback_store_and_recovers_the_primary_mapping() {
+        let harness = Harness::new(
+            "
+    - { name: primary, type: learn, cookie_name: primary_session }
+    - { name: backup, type: learn, cookie_name: backup_session }",
+        );
+        let first = harness.exchange(&health(&[]), &[], Some("primary_session=p-1")).await;
+        assert_eq!(first.served, P1);
+
+        let failover = harness
+            .exchange(
+                &health(&[0, 1]),
+                &[("cookie", "primary_session=p-1")],
+                Some("backup_session=b-1"),
+            )
+            .await;
+
+        failover.assert_served_by_backup();
+        harness.assert_failover_bindings("p-1", "b-1");
+        let cookies = [("cookie", "primary_session=p-1; backup_session=b-1")];
+        let recovered = harness.exchange(&health(&[]), &cookies, None).await;
+        assert_eq!(
+            recovered.served, P1,
+            "recovery reuses the primary cluster's original mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_without_sticky_config_pins_nothing() {
+        let harness = Harness::new(
+            "
+    - { name: primary, type: cookie, cookie_name: _praxis_primary }",
+        );
+        let key = harness
+            .exchange(&health(&[]), &[], None)
+            .await
+            .pinned_on_primary("_praxis_primary");
+        let primary_cookie = format!("_praxis_primary={key}");
+
+        let failover = harness
+            .exchange(&health(&[0, 1]), &[("cookie", &primary_cookie)], None)
+            .await;
+
+        failover.assert_served_by_backup();
+        assert!(
+            failover.set_cookies.is_empty(),
+            "no session is minted for the unconfigured fallback"
+        );
+        assert!(
+            harness.stores.get("backup").is_none(),
+            "no store exists for the fallback cluster"
+        );
+        assert_eq!(harness.binding("primary", &key).as_deref(), Some(P1));
+    }
+
+    #[tokio::test]
+    async fn disabled_sticky_failover_keeps_the_pin_until_every_primary_endpoint_is_down() {
+        let harness = Harness::new(
+            "
+    - { name: primary, type: cookie, cookie_name: _praxis_primary, failover: false }",
+        );
+        let key = harness
+            .exchange(&health(&[]), &[], None)
+            .await
+            .pinned_on_primary("_praxis_primary");
+        let primary_cookie = format!("_praxis_primary={key}");
+
+        let pinned = harness
+            .exchange(&health(&[0]), &[("cookie", &primary_cookie)], None)
+            .await;
+        let failover = harness
+            .exchange(&health(&[0, 1]), &[("cookie", &primary_cookie)], None)
+            .await;
+
+        assert_eq!(
+            (pinned.served.as_str(), pinned.chain.as_str()),
+            (P1, "-"),
+            "with a healthy primary endpoint left, the disabled-failover pin still wins"
+        );
+        failover.assert_served_by_backup();
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    /// What one request/response exchange produced.
+    struct Exchange {
+        /// Address of the endpoint that served the request.
+        served: String,
+        /// The rendered `fallback_chain` access-log field.
+        chain: String,
+        /// `Set-Cookie` values in the response to the client.
+        set_cookies: Vec<String>,
+    }
+
+    impl Exchange {
+        /// The value of the `Set-Cookie` named `name`.
+        fn cookie(&self, name: &str) -> Option<String> {
+            self.set_cookies.iter().find_map(|header| {
+                let pair = header.split(';').next()?;
+                pair.strip_prefix(name)?.strip_prefix('=').map(str::to_owned)
+            })
+        }
+
+        /// Assert the primary served and set the session cookie `name`;
+        /// returns the session key.
+        fn pinned_on_primary(&self, name: &str) -> String {
+            assert_eq!(self.served, P1, "round robin starts on the first primary endpoint");
+            self.cookie(name).expect("the primary pins a new session")
+        }
+
+        /// Assert the request failed over to the `backup` cluster.
+        fn assert_served_by_backup(&self) {
+            assert_eq!((self.served.as_str(), self.chain.as_str()), (BACKUP, "primary,backup"));
+        }
+    }
+
+    /// A `router` → `sticky_sessions` → `load_balancer` pipeline and the
+    /// session stores it writes.
+    struct Harness {
+        pipeline: FilterPipeline,
+        stores: Arc<SessionStoreRegistry>,
+    }
+
+    impl Harness {
+        /// Build the pipeline with `sticky_clusters` as the `sticky_sessions`
+        /// cluster list.
+        fn new(sticky_clusters: &str) -> Self {
+            let yaml = format!(
+                r#"
+- filter: router
+  routes:
+    - {{ path_prefix: "/", cluster: primary }}
+- filter: sticky_sessions
+  clusters:{sticky_clusters}
+- filter: load_balancer
+  clusters:
+    - {{ name: primary, endpoints: ["{P1}", "{P2}"], fallback_cluster: backup }}
+    - {{ name: backup, endpoints: ["{BACKUP}"] }}
+"#
+            );
+            let mut entries: Vec<crate::FilterEntry> = serde_yaml::from_str(&yaml).unwrap();
+            Self {
+                pipeline: FilterPipeline::build(&mut entries, &FilterRegistry::with_builtins()).unwrap(),
+                stores: Arc::new(SessionStoreRegistry::new()),
+            }
+        }
+
+        /// Run one request and response through the pipeline. The upstream
+        /// answers with `upstream_set_cookie`, if any.
+        async fn exchange(
+            &self,
+            health: &HealthRegistry,
+            request_headers: &[(&'static str, &str)],
+            upstream_set_cookie: Option<&str>,
+        ) -> Exchange {
+            let mut req = crate::test_utils::make_request(http::Method::GET, "/");
+            for (name, value) in request_headers {
+                req.headers.append(*name, http::HeaderValue::from_str(value).unwrap());
+            }
+            let mut resp = crate::test_utils::make_response();
+            if let Some(cookie) = upstream_set_cookie {
+                resp.headers
+                    .append(http::header::SET_COOKIE, http::HeaderValue::from_str(cookie).unwrap());
+            }
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            ctx.health_registry = Some(health);
+            ctx.session_stores = Some(&self.stores);
+            drop(self.pipeline.execute_http_request(&mut ctx).await.unwrap());
+            let served = ctx
+                .upstream
+                .as_ref()
+                .map(|upstream| upstream.address.to_string())
+                .unwrap();
+            let chain = ctx.fallback_chain_field();
+            ctx.response_header = Some(&mut resp);
+            drop(self.pipeline.execute_http_response(&mut ctx).await.unwrap());
+            let set_cookies = resp.headers.get_all(http::header::SET_COOKIE).iter();
+            let set_cookies = set_cookies.map(|value| value.to_str().unwrap().to_owned()).collect();
+            Exchange {
+                served,
+                chain,
+                set_cookies,
+            }
+        }
+
+        /// The endpoint `cluster`'s session store binds `key` to.
+        fn binding(&self, cluster: &str, key: &str) -> Option<Arc<str>> {
+            self.stores.get(cluster)?.get(key)
+        }
+
+        /// Assert the fallback pinned `backup_key` into its own store while
+        /// the primary store still holds only the original `primary_key`.
+        fn assert_failover_bindings(&self, primary_key: &str, backup_key: &str) {
+            assert_eq!(self.binding("backup", backup_key).as_deref(), Some(BACKUP));
+            assert_eq!(
+                self.binding("primary", primary_key).as_deref(),
+                Some(P1),
+                "the primary store keeps the original mapping"
+            );
+            assert_eq!(
+                self.stores.get("primary").unwrap().len(),
+                1,
+                "the primary store is untouched"
+            );
+        }
+    }
+
+    /// Health for both clusters, with the listed `primary` endpoints down.
+    fn health(primary_down: &[usize]) -> HealthRegistry {
+        multi_health_registry(&[("primary", &[P1, P2], primary_down), ("backup", &[BACKUP], &[])])
+    }
+}

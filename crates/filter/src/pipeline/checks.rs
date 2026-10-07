@@ -312,6 +312,31 @@ pub(super) fn check_duplicate_load_balancers(names: &[&str], errors: &mut Vec<St
     }
 }
 
+/// `tcp_access_log` must run after every `tcp_load_balancer` that declares
+/// `fallback_cluster`: failover selects the upstream and `fallback_chain` in
+/// the load balancer, and the log's `on_connect` record reads both. Pipelines
+/// whose load balancers declare no fallback are unrestricted.
+#[cfg(feature = "health-based-failover")]
+pub(super) fn check_tcp_access_log_ordering(filters: &[PipelineFilter], errors: &mut Vec<String>) {
+    let Some(lb_index) = filters
+        .iter()
+        .rposition(|pf| pf.filter.name() == "tcp_load_balancer" && !pf.filter.fallback_clusters().is_empty())
+    else {
+        return;
+    };
+    if filters
+        .iter()
+        .take(lb_index)
+        .any(|pf| pf.filter.name() == "tcp_access_log")
+    {
+        errors.push(
+            "tcp_access_log must appear after a tcp_load_balancer that declares fallback_cluster; otherwise its \
+             on_connect record logs the upstream and fallback_chain before failover selects them"
+                .to_owned(),
+        );
+    }
+}
+
 /// Multiple cluster-selecting filters before the same load balancer
 /// compete for `ctx.cluster`; the later one silently overwrites the
 /// earlier selection.
@@ -392,8 +417,11 @@ pub(super) fn check_misaligned_clusters(filters: &[PipelineFilter], errors: &mut
     check_branch_cluster_demands(filters, &top_lb, any_lb, errors);
 
     // The unused-cluster warning stays whole-pipeline: a cluster selected
-    // only inside a branch still counts as used.
+    // only inside a branch still counts as used, as does a `fallback_cluster`
+    // target, which failover reaches from its primary.
     let selected_clusters = super::clusters::extract_selected_clusters(filters);
+    #[cfg(feature = "health-based-failover")]
+    let selected_clusters = &selected_clusters | &super::clusters::extract_fallback_clusters(filters);
     let lb_clusters = super::clusters::extract_lb_clusters(filters);
     for cluster in &lb_clusters {
         if !selected_clusters.contains(cluster.as_str()) {

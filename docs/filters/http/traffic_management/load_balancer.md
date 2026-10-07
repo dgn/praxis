@@ -9,6 +9,8 @@ Selects an upstream endpoint using the cluster's configured strategy.
 
 Supported strategies: - `round_robin` (default): cycles through endpoints in order, respecting weights via endpoint expansion. - `least_connections`: picks the endpoint with the fewest active in-flight requests; decrements the counter on `on_response`. - `p2c`: samples two random endpoints and picks the less loaded one. - `random`: picks a uniformly random endpoint, weighted by endpoint weight. - `consistent_hash`: hashes a configurable request header (or the URI path when the header is absent) to pin requests to a stable endpoint. - `maglev`: hashes a configurable request header (or the URI path) through a Maglev lookup table for even distribution and minimal disruption when endpoints change.
 
+With the `health-based-failover` build feature, an inline cluster may also set `fallback_cluster` to another cluster in this filter's local `clusters:` list. When every endpoint in the routed cluster is unhealthy, the load balancer walks that chain until it finds the first healthy cluster or reaches the terminal cluster's panic mode. Every fallback-chain member must have a matching top-level health declaration with the same endpoint set; see `docs/operating/health-checking.md`.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -70,6 +72,7 @@ Supported strategies: - `round_robin` (default): cycles through endpoints in ord
 | `clusters[].retry_policy.retry_budget.min_retries_per_second` | integer | no | Floor on tokens per second even at low traffic. |
 | `clusters[].retry_policy.retry_body_limit_bytes` | integer | no | Max request body size eligible for replay (bytes). Defaults to 64 `KiB`. |
 | `clusters[].retry_policy.allow_non_idempotent` | bool | no | Allow retries for non-idempotent methods (POST/PATCH) when true. |
+| `clusters[].fallback_cluster` | string | no | Name of the cluster to route to when all of this cluster's endpoints are unhealthy. Valid only on an inline routing cluster (a `load_balancer` or `tcp_load_balancer`'s `clusters:` entry); rejected on a top-level health declaration. The reference chain is followed as far as it is configured and is validated acyclic, bounded, and protocol/provider-consistent at config load. See `docs/operating/health-checking.md`. |
 | `cluster_source` | `router` \| `bound_upstream` | no | Where the target cluster name comes from. `router` (the default) uses the cluster a preceding `router` selected. `bound_upstream` (needs the `upstream-binding` build feature) uses the request's logical binding, which lets a direct dispatch branch or an `iterative_request_router` step pick an endpoint with no router of its own; the bound cluster must be one of the clusters declared here, which startup validation checks. When an upstream was already selected, the filter does nothing. |
 
 ## Example

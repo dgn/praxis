@@ -34,12 +34,14 @@ pub fn http_send(addr: &str, request: &str) -> String {
 /// as the message is complete: the terminating zero-length chunk for
 /// `Transfer-Encoding: chunked`, exactly `Content-Length` body bytes for a
 /// fixed-size body, and read-to-EOF otherwise (connection-close framing).
+/// A framed response is read no further than its end, so a keep-alive
+/// `stream` is left ready for the next request.
 ///
 /// Reading to EOF unconditionally (the old behaviour) blocked on the socket
 /// read timeout whenever the proxy kept a keep-alive connection open after the
 /// response was already fully received, adding seconds to every such test. The
 /// read timeout set by the caller remains a backstop for misbehaving peers.
-fn read_full_response(stream: &mut TcpStream) -> String {
+pub fn read_full_response(stream: &mut TcpStream) -> String {
     let mut data = Vec::new();
 
     // Accumulate until the header terminator is seen (or the stream ends).

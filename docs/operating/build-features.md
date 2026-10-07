@@ -77,6 +77,7 @@ really is out of the build.
 | `router-json-aliases` | off (experimental) | The `router` filter's JSON-alias body-routing groundwork. | Groundwork only: it is not wired into routing, and a route that sets `json_aliases` is rejected at build even with the feature on. Default builds do not accept the keys. |
 | `bound-upstream-request-body` | off (experimental) | The `HttpFilter::on_bound_upstream_request_body` hook, run once at the logical-binding barrier. | For out-of-tree filters that must inspect or rewrite the request body against the bound upstream; no in-tree filter uses it yet. Pulls in `upstream-binding`. |
 | `chain-binding` | off (experimental) | The `register_chain_binding` outbound-callout API (`ChainBindingContext::bind_chain`) and its authority-bound deferred credentials (`PendingCredentials`, `DeferredCredential`). | For out-of-tree callout filters; no in-tree consumer yet. |
+| `health-based-failover` | off (experimental) | Per-inline-routing-cluster `fallback_cluster` chains for the HTTP/TCP load balancers, the `fallback_chain` access-log field, and `praxis_lb_fallback_total`. | On when a load balancer should walk a health-gated fallback chain instead of panicking immediately on an all-down routed cluster. The server feature forwards to `praxis-core`, `praxis-filter`, and `praxis-protocol`; off, `fallback_cluster` is rejected as an unknown config field and no fallback-walk/log/metric code is compiled. |
 | `spiffe` | off (experimental) | SPIFFE X.509-SVID mTLS peer identity (the `require_named` listener mode) and the `peer_identity_trust` filter. | On for mTLS peer-identity authorization. Adds `spiffe` and `x509-parser`. |
 | `dev` | off | Developer convenience bundle (currently enables `basic-auth-filter`). | Local development builds. |
 | `experimental` | off | Marker feature set transitively by experimental features; drives a startup warning. | Not selected directly; it lights up when an experimental feature is enabled. |
@@ -127,6 +128,14 @@ production` at startup. Do not run an experimental build in production.
   destination matches the authority the credential was issued for. This is the
   outbound-callout mechanism; it has no in-tree consumer yet and exists for
   out-of-tree callout filters.
+- **`health-based-failover`**: per-inline-routing-cluster fallback chains for
+  `load_balancer` and `tcp_load_balancer`. An inline cluster may set
+  `fallback_cluster` to another cluster in the same filter-local `clusters:`
+  list; when every endpoint in the routed cluster is unhealthy, the load
+  balancer walks that chain until it finds a healthy cluster or reaches the
+  terminal cluster's panic mode. The feature also adds the `fallback_chain`
+  access-log field and the `praxis_lb_fallback_total` metric. See
+  [Health Checking](health-checking.md).
 - **`spiffe`**: SPIFFE X.509-SVID mutual-TLS peer identity, including the
   `require_named` listener client-cert mode, plus the `peer_identity_trust`
   filter that authorizes clients by mTLS peer identity. Note that
@@ -148,8 +157,8 @@ production` at startup. Do not run an experimental build in production.
   `policy-engine` by the widest margin. Most filters are always compiled in and
   share dependencies with the core proxy, so gating them individually would not
   remove a crate. The experimental filter gates (`upstream-binding`,
-  `iterative-request-router`, `chain-binding`, `router-json-aliases`,
-  `bound-upstream-request-body`) exist
+  `iterative-request-router`, `chain-binding`, `health-based-failover`,
+  `router-json-aliases`, `bound-upstream-request-body`) exist
   to keep unfinished or not-for-production surface out of default builds
   rather than to save a crate; `spiffe` and `cloud-events-filter` do
   additionally drop dependencies

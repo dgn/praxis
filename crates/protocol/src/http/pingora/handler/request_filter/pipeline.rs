@@ -20,7 +20,7 @@ use tracing::{Instrument as _, error};
 use super::{
     super::{
         super::{
-            context::PingoraRequestCtx,
+            context::{PingoraRequestCtx, take_fallback_chain, write_back_fallback_chain},
             convert::{request_header_from_session, send_rejection_for},
         },
         body_util::clamp_body_mode_to_ceiling,
@@ -372,6 +372,8 @@ async fn run_pipeline(
                 },
             }
         }
+
+        write_back_fallback_chain(ctx, take_fallback_chain(&mut filter_ctx));
 
         (
             action,
@@ -872,9 +874,63 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "health-based-failover")]
+    #[tokio::test]
+    async fn failover_writes_back_effective_cluster_and_chain() {
+        let pipeline = failover_pipeline();
+        let mut ctx = make_ctx();
+        ctx.cluster = Some(Arc::from("primary"));
+
+        drop(run_pipeline(&pipeline, make_request(), &mut ctx).await.unwrap());
+
+        assert_eq!(ctx.cluster.as_deref(), Some("backup"));
+        assert_eq!(
+            ctx.upstream.as_ref().map(|upstream| &*upstream.address),
+            Some("127.0.0.1:9090")
+        );
+        assert_eq!(
+            ctx.filter_context_for(&pipeline, None)
+                .expect("run_pipeline stores the request snapshot")
+                .fallback_chain_field(),
+            "primary,backup",
+            "later phases must see the chain the request phase recorded"
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
+
+    /// Build a `load_balancer` pipeline whose `primary` cluster is all down
+    /// and falls back to `backup`.
+    #[cfg(feature = "health-based-failover")]
+    fn failover_pipeline() -> FilterPipeline {
+        let mut entries: Vec<praxis_core::config::FilterEntry> = serde_yaml::from_str(
+            r#"
+- filter: load_balancer
+  clusters:
+    - name: primary
+      endpoints: ["127.0.0.1:8080"]
+      fallback_cluster: backup
+    - name: backup
+      endpoints: ["127.0.0.1:9090"]
+"#,
+        )
+        .unwrap();
+        let mut pipeline = FilterPipeline::build(&mut entries, &FilterRegistry::with_builtins()).unwrap();
+        let primary = praxis_core::health::ClusterHealthEntry::new(
+            vec![praxis_core::health::EndpointHealth::new()],
+            vec![Arc::from("127.0.0.1:8080")],
+            None,
+            None,
+        );
+        primary.endpoints()[0].mark_unhealthy();
+        pipeline.set_health_registry(Arc::new(std::collections::HashMap::from([(
+            Arc::from("primary"),
+            Arc::new(primary),
+        )])));
+        pipeline
+    }
 
     /// Create a minimal GET request for tests.
     fn make_request() -> Request {

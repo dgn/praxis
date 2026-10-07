@@ -14,7 +14,7 @@ use bytes::Bytes;
 use praxis_core::{config::ABSOLUTE_MAX_BODY_BYTES, connectivity::Upstream};
 use praxis_filter::{BodyBuffer, BodyMode, RequestExtensions};
 
-use crate::http::pingora::context::PingoraRequestCtx;
+use crate::http::pingora::context::{PingoraRequestCtx, take_fallback_chain, write_back_fallback_chain};
 
 /// Clamp a runtime-selected body mode to the byte ceiling implied by `baseline`.
 ///
@@ -133,6 +133,9 @@ pub(super) fn release_stream_buffer(
 pub(super) struct BodyFilterOutput {
     /// Cluster selected by the filter pipeline.
     pub(super) cluster: Option<Arc<str>>,
+    /// Fallback chain walked for this request, if any. Always `None`
+    /// without the `health-based-failover` feature.
+    pub(super) fallback_chain: Option<Arc<[Arc<str>]>>,
     /// Upstream endpoint selected by the load balancer.
     pub(super) upstream: Option<Upstream>,
     /// Type-safe request-scoped extension container.
@@ -157,6 +160,7 @@ impl BodyFilterOutput {
     pub(super) fn take_from(fctx: &mut praxis_filter::HttpFilterContext<'_>) -> Self {
         Self {
             cluster: fctx.cluster.take(),
+            fallback_chain: take_fallback_chain(fctx),
             upstream: fctx.upstream.take(),
             extensions: std::mem::take(&mut fctx.extensions),
             filter_metadata: std::mem::take(&mut fctx.filter_metadata),
@@ -171,6 +175,7 @@ impl BodyFilterOutput {
     /// Write the shared fields back to the protocol context.
     pub(super) fn write_back(self, ctx: &mut PingoraRequestCtx) {
         ctx.cluster = self.cluster;
+        write_back_fallback_chain(ctx, self.fallback_chain);
         ctx.upstream = self.upstream;
         ctx.extensions = self.extensions;
         ctx.filter_metadata = self.filter_metadata;

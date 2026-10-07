@@ -88,6 +88,10 @@ impl FilterPipeline {
     /// same SSRF and insecure-TLS rules as top-level `clusters:`, instead of
     /// silently bypassing them.
     ///
+    /// With `health-based-failover`, bound outbound chains are not checked
+    /// against the config's failover health contract here; the server builds
+    /// through `build_with_chains_and_health_contract`, which checks them.
+    ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if any filter fails to instantiate
@@ -101,6 +105,37 @@ impl FilterPipeline {
         insecure_options: &InsecureOptions,
     ) -> Result<Self, FilterError> {
         let filters = super::build_branch::resolve_chain_filters(entries, registry, chains, 0, insecure_options)?;
+        Ok(Self::from_filters(filters))
+    }
+
+    /// Like [`build_with_chains`], but also checks every outbound chain bound
+    /// during the build against `health_contract`, as the whole-config
+    /// validation checks `filter_chains`: a bound chain's fallback members
+    /// need matching top-level health declarations, or failover could never
+    /// see them as unhealthy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] for any [`build_with_chains`] error, or if a
+    /// bound outbound chain violates `health_contract`.
+    ///
+    /// [`build_with_chains`]: FilterPipeline::build_with_chains
+    #[cfg(feature = "health-based-failover")]
+    pub fn build_with_chains_and_health_contract(
+        entries: &mut [FilterEntry],
+        registry: &FilterRegistry,
+        chains: &HashMap<&str, &[FilterEntry]>,
+        insecure_options: &InsecureOptions,
+        health_contract: &praxis_core::config::FallbackHealthContract,
+    ) -> Result<Self, FilterError> {
+        let filters = super::build_branch::resolve_root_chain_filters(
+            entries,
+            registry,
+            chains,
+            0,
+            insecure_options,
+            Some(health_contract),
+        )?;
         Ok(Self::from_filters(filters))
     }
 
@@ -287,6 +322,8 @@ impl FilterPipeline {
         if !skip.duplicate_load_balancers {
             super::checks::check_duplicate_load_balancers(&names, &mut errors);
         }
+        #[cfg(feature = "health-based-failover")]
+        super::checks::check_tcp_access_log_ordering(&self.filters, &mut errors);
         if !skip.conflicting_cluster_selectors {
             super::checks::check_conflicting_cluster_selectors(&self.filters, &mut errors);
         }

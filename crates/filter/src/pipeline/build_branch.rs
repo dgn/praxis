@@ -35,6 +35,8 @@
 
 use std::{cell::Cell, collections::HashMap, mem, sync::Arc};
 
+#[cfg(feature = "health-based-failover")]
+use praxis_core::config::FallbackHealthContract;
 use praxis_core::config::{
     BranchChainConfig, BranchCondition, ChainRef, FilterEntry, InsecureOptions, MAX_BRANCH_DEPTH, count_build_branches,
 };
@@ -114,6 +116,12 @@ struct BuildContext<'a> {
     /// branch resolution binds at the correct outbound depth rather than
     /// inheriting the branch depth.
     outbound_depth: usize,
+
+    /// The config's failover health contract, forwarded into each
+    /// [`ChainBindingContext`] so outbound chains bound from inside a branch
+    /// are checked against it too.
+    #[cfg(feature = "health-based-failover")]
+    health_contract: Option<&'a FallbackHealthContract>,
 }
 
 // -----------------------------------------------------------------------------
@@ -133,6 +141,35 @@ pub(super) fn resolve_chain_filters(
     chains: &HashMap<&str, &[FilterEntry]>,
     depth: usize,
     insecure: &InsecureOptions,
+) -> Result<Vec<PipelineFilter>, FilterError> {
+    resolve_root_chain_filters(
+        entries,
+        registry,
+        chains,
+        depth,
+        insecure,
+        #[cfg(feature = "health-based-failover")]
+        None,
+    )
+}
+
+/// Body of [`resolve_chain_filters`]: seeds the build-wide resolution state.
+/// With `health-based-failover`, `health_contract` (when given) is applied
+/// to every outbound chain bound during the build.
+#[cfg_attr(
+    feature = "health-based-failover",
+    expect(
+        clippy::too_many_arguments,
+        reason = "the failover health contract joins the build-wide resolution inputs"
+    )
+)]
+pub(super) fn resolve_root_chain_filters(
+    entries: &mut [FilterEntry],
+    registry: &FilterRegistry,
+    chains: &HashMap<&str, &[FilterEntry]>,
+    depth: usize,
+    insecure: &InsecureOptions,
+    #[cfg(feature = "health-based-failover")] health_contract: Option<&FallbackHealthContract>,
 ) -> Result<Vec<PipelineFilter>, FilterError> {
     let mut next_filter_id: usize = 0;
     let stack = ResolutionStack::new();
@@ -160,6 +197,8 @@ pub(super) fn resolve_chain_filters(
         &budget,
         &branch_budget,
         0,
+        #[cfg(feature = "health-based-failover")]
+        health_contract,
     )
 }
 
@@ -184,6 +223,7 @@ pub(crate) fn resolve_chain_filters_with_stack(
     budget: &Cell<usize>,
     branch_budget: &Cell<usize>,
     outbound_depth: usize,
+    #[cfg(feature = "health-based-failover")] health_contract: Option<&FallbackHealthContract>,
 ) -> Result<Vec<PipelineFilter>, FilterError> {
     if depth > MAX_BRANCH_DEPTH {
         return Err(format!("branch nesting depth exceeds maximum ({MAX_BRANCH_DEPTH})").into());
@@ -193,6 +233,8 @@ pub(crate) fn resolve_chain_filters_with_stack(
     // outbound bindings deep we are. The binding context carries only the latter.
     let binding_ctx =
         ChainBindingContext::new(registry, chains, stack, outbound_depth, insecure, budget, branch_budget);
+    #[cfg(feature = "health-based-failover")]
+    let binding_ctx = binding_ctx.with_health_contract(health_contract);
     let (mut filters, branch_configs) = build_filters(entries, next_filter_id, &binding_ctx, budget)?;
     let pipeline_filter_type_names: Vec<&str> = filters.iter().map(|pf| pf.filter.name()).collect();
     let mut bctx = BuildContext {
@@ -205,6 +247,8 @@ pub(crate) fn resolve_chain_filters_with_stack(
         budget,
         branch_budget,
         outbound_depth,
+        #[cfg(feature = "health-based-failover")]
+        health_contract,
     };
     let name_index = build_name_index(&filters);
     attach_branches(&mut filters, branch_configs, &mut bctx, &name_index, depth)?;
@@ -441,6 +485,8 @@ fn resolve_chain_refs(
             bctx.budget,
             bctx.branch_budget,
             bctx.outbound_depth,
+            #[cfg(feature = "health-based-failover")]
+            bctx.health_contract,
         )?);
     }
     Ok(filters)
@@ -849,6 +895,8 @@ mod tests {
             budget: &budget,
             branch_budget: &branch_budget,
             outbound_depth: 0,
+            #[cfg(feature = "health-based-failover")]
+            health_contract: None,
         };
         let refs = vec![ChainRef::Named("nonexistent".to_owned())];
         let err = resolve_chain_refs(&refs, &mut bctx, 0).unwrap_err();

@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) mod consistent_hash;
 pub(crate) mod endpoint;
+#[cfg(feature = "health-based-failover")]
+pub(crate) mod failover;
 pub(crate) mod hash;
 pub(crate) mod least_connections;
 pub(crate) mod maglev;

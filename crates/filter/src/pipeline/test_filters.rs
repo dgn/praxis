@@ -33,6 +33,18 @@ pub(in crate::pipeline) fn lb_filter(clusters: &[&str]) -> PipelineFilter {
     })
 }
 
+/// A load balancer stand-in whose `clusters` include `fallback_cluster`
+/// targets `fallbacks`.
+#[cfg(feature = "health-based-failover")]
+pub(in crate::pipeline) fn fallback_lb(name: &'static str, clusters: &[&str], fallbacks: &[&str]) -> PipelineFilter {
+    capability_filter(CapabilityFilter {
+        name,
+        load_balancer_clusters: owned(clusters),
+        fallback_clusters: owned(fallbacks),
+        ..CapabilityFilter::default()
+    })
+}
+
 pub(in crate::pipeline) fn noop_filter(name: &'static str) -> PipelineFilter {
     capability_filter(CapabilityFilter {
         name,
@@ -170,6 +182,8 @@ struct CapabilityFilter {
     selects_cluster: bool,
     selected_clusters: Vec<String>,
     load_balancer_clusters: Vec<String>,
+    #[cfg(feature = "health-based-failover")]
+    fallback_clusters: Vec<String>,
     #[cfg(feature = "upstream-binding")]
     binds_upstream: bool,
     #[cfg(feature = "upstream-binding")]
@@ -201,6 +215,11 @@ impl HttpFilter for CapabilityFilter {
 
     fn load_balancer_clusters(&self) -> Vec<String> {
         self.load_balancer_clusters.clone()
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    fn fallback_clusters(&self) -> Vec<String> {
+        self.fallback_clusters.clone()
     }
 
     #[cfg(feature = "upstream-binding")]

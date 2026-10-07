@@ -922,6 +922,7 @@ mod tests {
 
         let output = body_util::BodyFilterOutput {
             cluster: Some(Arc::from("test-cluster")),
+            fallback_chain: None,
             upstream: Some(Upstream {
                 address: Arc::from("10.0.0.1:80"),
                 authority: None,

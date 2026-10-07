@@ -218,6 +218,185 @@ state. If both are configured, a passive failure
 increments the same failure counter that active probe
 failures use.
 
+## Health-Based Failover
+
+With the `health-based-failover` experimental build
+feature enabled (see [Build Features](build-features.md)),
+an inline cluster in `load_balancer` or
+`tcp_load_balancer` may set `fallback_cluster` to another
+cluster in the same local `clusters:` list. When every
+endpoint in the routed cluster is unhealthy, the load
+balancer walks that chain to find the first cluster that
+still has at least one healthy endpoint.
+
+```yaml
+clusters:
+  - name: primary
+    endpoints: ["127.0.0.1:3001", "127.0.0.1:3002"]
+    health_check:
+      type: http
+      path: "/healthz"
+      interval_ms: 5000
+      timeout_ms: 2000
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+
+  - name: secondary
+    endpoints: ["127.0.0.1:3011", "127.0.0.1:3012"]
+    health_check:
+      type: http
+      path: "/healthz"
+      interval_ms: 5000
+      timeout_ms: 2000
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: primary
+      - filter: load_balancer
+        clusters:
+          - name: primary
+            endpoints: ["127.0.0.1:3001", "127.0.0.1:3002"]
+            fallback_cluster: secondary
+          - name: secondary
+            endpoints: ["127.0.0.1:3011", "127.0.0.1:3012"]
+```
+
+### Health ownership and where `fallback_cluster` is valid
+
+Praxis keeps health ownership at the top level:
+
+- top-level `clusters:` owns active probes, passive state,
+  the admin view, and reload carry-over;
+- inline `load_balancer` / `tcp_load_balancer`
+  `clusters:` owns endpoint selection, transport options,
+  and `fallback_cluster`.
+
+`fallback_cluster` is valid only on those inline routing
+clusters. A top-level cluster declaration never carries
+traffic directly and must not set `fallback_cluster`.
+
+### Fallback health contract
+
+Every cluster that participates in a fallback chain —
+including the terminal/last one — must have a same-named
+top-level `clusters:` entry with:
+
+- a `health_check` block; and
+- an identical endpoint address set.
+
+That shared contract lets the inline data path reuse the
+top-level `HealthRegistry`. A fallback-chain member must
+not declare its own inline `health_check`; the top-level
+declaration is the only health-policy source. Praxis also
+requires each fallback edge's two clusters to agree on
+`http.application_protocol` and
+`http.application_provider`.
+
+The contract applies only to configs that declare
+`fallback_cluster`; other configs validate as they do
+without the feature. Once any inline cluster declares
+one, every inline definition of a health-checked name
+must match its top-level endpoint address set, fallback
+member or not, because health state is keyed by cluster
+name. Inline outbound chains bound at pipeline build are
+held to the same contract.
+
+### Walk, bounds, and panic mode
+
+The fallback walk is re-evaluated for every request or
+TCP connection:
+
+1. Route to the configured primary cluster.
+2. If at least one primary endpoint is healthy, stay on
+   the primary.
+3. If every primary endpoint is unhealthy, follow
+   `fallback_cluster`.
+4. Repeat until Praxis finds the first cluster with at
+   least one healthy endpoint.
+
+Chains must be acyclic, must not self-reference, and may
+contain at most 16 fallback edges (17 nodes total). If
+every cluster in the chain is down, Praxis stops on the
+terminal cluster and enters that cluster's existing panic
+mode: it still attempts best-effort selection from the
+terminal cluster rather than failing the walk early.
+
+When any primary endpoint recovers, the next request
+re-evaluates the shared health state and returns to the
+primary automatically — there is no latch or timer.
+
+### Sticky sessions, bound upstream, and explicit upstreams
+
+Sticky sessions remain keyed per cluster name. If a
+request is pinned to the primary cluster and every primary
+endpoint is unhealthy, Praxis discards that primary pin
+for that request and selects normally from the effective
+fallback cluster, even when `sticky_sessions.failover` is
+`false`. The primary cluster's sticky store is left
+unchanged; if the fallback cluster also has sticky-session
+config, its own store records the endpoint that served.
+That record does not pin later requests during the outage:
+`sticky_sessions` looks up pins for the routed primary
+before the load balancer walks the chain.
+
+Once a primary endpoint is healthy again, Praxis resumes
+using the primary cluster's original mapping, provided the
+client still presents the primary's session key:
+
+- `cookie`: give every cluster in a fallback chain its own
+  `cookie_name`. With a shared name, the fallback
+  cluster's `Set-Cookie` replaces the primary session
+  cookie in the client, and recovery starts a new primary
+  session instead of reusing the original endpoint.
+- `header`: the client supplies the key and Praxis never
+  sets it, so a shared `header_name` is safe as long as
+  the client keeps sending the same value.
+- `learn`: the backend owns the cookie. If a fallback
+  backend issues its own session under the primary's
+  cookie name, it replaces the primary session in the
+  client, just as a shared `cookie_name` does.
+
+With `load_balancer.cluster_source: bound_upstream`, the
+logical bound cluster stays the routed primary, so
+`bound_upstream` conditions and bound-body filters still
+see that primary identity. Selected-upstream metadata,
+transport selection, access logs, and metrics report the
+effective cluster that actually served.
+
+An explicitly selected upstream from `endpoint_selector`
+is the exception: Praxis never substitutes a fallback for
+that request, even if the routed cluster is fully down, so
+no fallback chain is recorded and no fallback metric is
+emitted.
+
+### Access logs, metrics, and TCP ordering
+
+When failover occurs, the HTTP `access_log` and TCP
+`tcp_access_log` filters expose a `fallback_chain` field
+containing the walked cluster names joined by `,`, with
+the routed cluster first and the effective cluster last.
+When no failover occurred, the field renders `-`. The
+HTTP access log's existing `cluster` field continues to
+show the effective cluster that served the request.
+
+Praxis also emits
+`praxis_lb_fallback_total{cluster="<from>",fallback="<to>"}`
+once per hop actually walked. A two-hop walk `A -> B -> C`
+produces one sample for `A -> B` and one for `B -> C`.
+
+In a TCP pipeline whose `tcp_load_balancer` declares
+`fallback_cluster`, `tcp_access_log` must appear after
+it. That ordering is validated at build time so the
+connect record logs the `upstream` and `fallback_chain`
+that failover selected. Pipelines without
+`fallback_cluster` are unrestricted.
+
 ## Admin Health Endpoints
 
 The admin listener exposes two health endpoints for
@@ -464,6 +643,12 @@ Changing health check settings in the config file
 triggers a rebuild of the health registry and probe
 tasks without restarting the proxy. In-flight requests
 complete on the previous configuration.
+
+With `health-based-failover`, the same top-level/inline
+health contract is checked on reload too. A reload that
+introduces a missing top-level declaration, mismatched
+endpoints, or another invalid fallback contract is
+rejected and the live pipeline is left unchanged.
 
 ## Monitoring
 

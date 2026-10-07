@@ -61,6 +61,8 @@ pub use runtime::{DEFAULT_SUBREQUEST_POOL_SIZE, RuntimeConfig};
 #[cfg(feature = "otel")]
 pub(crate) use telemetry::OTLP_PROTOCOL_ENV_VAR;
 pub use telemetry::TelemetryConfig;
+#[cfg(feature = "health-based-failover")]
+pub use validate::{FallbackHealthContract, MAX_FALLBACK_CHAIN_EDGES, validate_chain_entries_health_contract};
 pub use validate::{
     MAX_BRANCH_DEPTH, MAX_ITERATIONS_CEILING, TERMINAL_FILTERS, count_build_branches, is_ssrf_sensitive,
     validate_chain_entries_branch_chains, validate_chain_entries_cardinality, validate_chain_entries_conditions,
@@ -650,6 +652,10 @@ filter_chains:
                 .file_name()
                 .is_some_and(|n| n == "bound-upstream-condition.yaml" || n == "bound-upstream-dispatch.yaml")
             {
+                continue;
+            }
+            #[cfg(not(feature = "health-based-failover"))]
+            if entry.file_name().is_some_and(|n| n == "health-based-failover.yaml") {
                 continue;
             }
             Config::from_file(&entry).unwrap_or_else(|err| panic!("{}: {err}", entry.display()));

@@ -494,6 +494,8 @@ mod tests {
             sni: None,
             upstream_addr: Some(std::borrow::Cow::Borrowed("10.0.0.1:80")),
             cluster: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: None,
             kv_stores: None,
             connect_time: std::time::Instant::now(),

@@ -11,6 +11,8 @@ Reads `ctx.cluster` to find the target cluster, selects an endpoint via the conf
 
 If all endpoints are unhealthy, the filter enters panic mode and routes to all endpoints.
 
+With the `health-based-failover` build feature, an inline cluster may also set `fallback_cluster` to another cluster in this filter's local `clusters:` list. When every endpoint in the routed cluster is unhealthy, the filter walks that chain until it finds the first healthy cluster or reaches the terminal cluster's panic mode. Every fallback-chain member must have a matching top-level health declaration with the same endpoint set; see `docs/operating/health-checking.md`.
+
 **Note:** `retry_policy` is an HTTP-only feature and is ignored for TCP listeners. The field appears in the cluster schema because the same `Cluster` type is shared across protocols.
 
 ## Configuration
@@ -74,6 +76,7 @@ If all endpoints are unhealthy, the filter enters panic mode and routes to all e
 | `clusters[].retry_policy.retry_budget.min_retries_per_second` | integer | no | Floor on tokens per second even at low traffic. |
 | `clusters[].retry_policy.retry_body_limit_bytes` | integer | no | Max request body size eligible for replay (bytes). Defaults to 64 `KiB`. |
 | `clusters[].retry_policy.allow_non_idempotent` | bool | no | Allow retries for non-idempotent methods (POST/PATCH) when true. |
+| `clusters[].fallback_cluster` | string | no | Name of the cluster to route to when all of this cluster's endpoints are unhealthy. Valid only on an inline routing cluster (a `load_balancer` or `tcp_load_balancer`'s `clusters:` entry); rejected on a top-level health declaration. The reference chain is followed as far as it is configured and is validated acyclic, bounded, and protocol/provider-consistent at config load. See `docs/operating/health-checking.md`. |
 
 ## Example
 

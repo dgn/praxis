@@ -62,6 +62,12 @@ chain-binding = []
 # default; experimental. Grouped with the server's `spiffe` feature.
 spiffe = []
 
+# Per-cluster health-based failover: `fallback_cluster` on inline routing
+# clusters, the failover walk, and the associated access-log/metrics fields.
+# Off by default; experimental. The protocol crate's
+# `health-based-failover` turns it on.
+health-based-failover = ["praxis-core/health-based-failover"]
+
 # This crate inherits the full workspace lint set. Unlike the other crates it
 # does NOT raise `unsafe_code` back to "forbid": the `json_ops::simd_scan` SIMD
 # intrinsics need unsafe, and their functions opt in with a reasoned

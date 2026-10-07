@@ -36,7 +36,7 @@ use crate::{
 /// ```yaml
 /// filter: access_log
 /// sample_rate: 0.1   # optional; log ~10% of requests (default 1.0)
-/// fields:            # optional; replaces default ten fields when present
+/// fields:            # optional; replaces the default field set when present
 ///   - method
 ///   - path
 ///   - status
@@ -51,9 +51,11 @@ use crate::{
 ///   paths: ["/api"]             # OR within list; segment-boundary prefixes
 /// ```
 ///
-/// When `fields` is omitted, the default ten fields are emitted:
+/// When `fields` is omitted, the default ten fields are emitted
+/// (eleven with `health-based-failover`):
 /// `method`, `path`, `client_ip`, `status`, `duration_ms`, `cluster`,
-/// `upstream`, `request_id`, `request_body_bytes`, `response_body_bytes`.
+/// `upstream`, `request_id`, `request_body_bytes`, `response_body_bytes`
+/// and, with `health-based-failover`, `fallback_chain`.
 ///
 /// Pipeline `conditions` / `response_conditions` on the filter entry still gate
 /// whether this filter runs; access-log `conditions` are evaluated at emit time.
@@ -97,7 +99,8 @@ struct AccessLogConfig {
     #[serde(default = "default_sample_rate")]
     sample_rate: f64,
 
-    /// Scalar field tokens; replaces the default ten when present.
+    /// Scalar field tokens; replaces the default ten fields when present
+    /// (eleven with `health-based-failover`, which adds `fallback_chain`).
     fields: Option<Vec<serde_yaml::Value>>,
 
     /// Request header names allowed for `request_header.<name>` tokens.
@@ -171,6 +174,8 @@ const DEFAULT_FIELDS: &[&str] = &[
     "request_id",
     "request_body_bytes",
     "response_body_bytes",
+    #[cfg(feature = "health-based-failover")]
+    "fallback_chain",
 ];
 
 // -----------------------------------------------------------------------------
@@ -200,6 +205,11 @@ enum FieldToken {
     ResponseHeader(String),
     /// A filter-metadata key, such as `llm.model`.
     Metadata(String),
+    /// Health-based-failover chain walked for this request, routed cluster
+    /// first and effective cluster last, joined by `,`. Renders `-` when no
+    /// failover occurred (or no load balancer with `fallback_cluster` ran).
+    #[cfg(feature = "health-based-failover")]
+    FallbackChain,
 }
 
 /// Runtime emit plan built from config.
@@ -399,21 +409,24 @@ impl AccessLogFilter {
         emit_projected_record(&record);
     }
 
-    /// Default ten-field emit path.
+    /// Default ten-field emit path (eleven with `health-based-failover`).
     fn emit_default(ctx: &HttpFilterContext<'_>, status: u16, duration_ms: u64) {
         let path = sanitize_for_log(ctx.request.uri.path());
         let client_ip = ctx.client_addr.map(|a| a.to_string()).unwrap_or_default();
-        info!(
-            method = %ctx.request.method,
-            path = %path,
-            client_ip = %client_ip,
-            status,
-            duration_ms,
-            cluster = ctx.cluster_name().unwrap_or("-"),
-            upstream = ctx.upstream_addr().unwrap_or("-"),
-            request_id = ctx.request_id().unwrap_or("-"),
-            request_body_bytes = ctx.request_body_bytes,
-            response_body_bytes = ctx.response_body_bytes,
+        info_with_fallback_chain!(
+            ctx,
+            {
+                method = %ctx.request.method,
+                path = %path,
+                client_ip = %client_ip,
+                status,
+                duration_ms,
+                cluster = ctx.cluster_name().unwrap_or("-"),
+                upstream = ctx.upstream_addr().unwrap_or("-"),
+                request_id = ctx.request_id().unwrap_or("-"),
+                request_body_bytes = ctx.request_body_bytes,
+                response_body_bytes = ctx.response_body_bytes,
+            },
             "access"
         );
     }
@@ -477,35 +490,41 @@ pub fn emit_access_record(ctx: &HttpFilterContext<'_>, status: u16) {
 
     #[cfg(feature = "otel")]
     if let Some((trace_id, span_id)) = extract_otel_ids() {
-        info!(
-            method = %ctx.request.method,
-            path = %path,
-            client_ip = %client_ip,
-            cluster = ctx.cluster_name().unwrap_or("-"),
-            duration_ms = truncate_u128(ctx.request_start.elapsed().as_millis()),
-            request_body_bytes = ctx.request_body_bytes,
-            request_id = ctx.request_id().unwrap_or("-"),
-            response_body_bytes = ctx.response_body_bytes,
-            span_id = %span_id,
-            status,
-            trace_id = %trace_id,
-            upstream = ctx.upstream_addr().unwrap_or("-"),
+        info_with_fallback_chain!(
+            ctx,
+            {
+                method = %ctx.request.method,
+                path = %path,
+                client_ip = %client_ip,
+                cluster = ctx.cluster_name().unwrap_or("-"),
+                duration_ms = truncate_u128(ctx.request_start.elapsed().as_millis()),
+                request_body_bytes = ctx.request_body_bytes,
+                request_id = ctx.request_id().unwrap_or("-"),
+                response_body_bytes = ctx.response_body_bytes,
+                span_id = %span_id,
+                status,
+                trace_id = %trace_id,
+                upstream = ctx.upstream_addr().unwrap_or("-"),
+            },
             "access"
         );
         return;
     }
 
-    info!(
-        method = %ctx.request.method,
-        path = %path,
-        client_ip = %client_ip,
-        status,
-        duration_ms = truncate_u128(ctx.request_start.elapsed().as_millis()),
-        cluster = ctx.cluster_name().unwrap_or("-"),
-        upstream = ctx.upstream_addr().unwrap_or("-"),
-        request_id = ctx.request_id().unwrap_or("-"),
-        request_body_bytes = ctx.request_body_bytes,
-        response_body_bytes = ctx.response_body_bytes,
+    info_with_fallback_chain!(
+        ctx,
+        {
+            method = %ctx.request.method,
+            path = %path,
+            client_ip = %client_ip,
+            status,
+            duration_ms = truncate_u128(ctx.request_start.elapsed().as_millis()),
+            cluster = ctx.cluster_name().unwrap_or("-"),
+            upstream = ctx.upstream_addr().unwrap_or("-"),
+            request_id = ctx.request_id().unwrap_or("-"),
+            request_body_bytes = ctx.request_body_bytes,
+            response_body_bytes = ctx.response_body_bytes,
+        },
         "access"
     );
 }
@@ -604,6 +623,10 @@ impl EmitPlan {
                 FieldToken::Metadata(key) => {
                     let value = ctx.get_metadata(key).unwrap_or("-").to_owned();
                     record.insert(format!("metadata.{key}"), value);
+                },
+                #[cfg(feature = "health-based-failover")]
+                FieldToken::FallbackChain => {
+                    record.insert("fallback_chain".to_owned(), ctx.fallback_chain_field());
                 },
             }
         }
@@ -793,6 +816,8 @@ fn parse_scalar_field_token(token: &str) -> Result<FieldToken, FilterError> {
         "response_body_bytes" => Ok(FieldToken::ResponseBodyBytes),
         "trace_id" => Ok(FieldToken::TraceId),
         "span_id" => Ok(FieldToken::SpanId),
+        #[cfg(feature = "health-based-failover")]
+        "fallback_chain" => Ok(FieldToken::FallbackChain),
         "filter_results" => Err("access_log: filter_results is not supported in v1".into()),
         other => Err(format!("access_log: unknown field token {other:?}").into()),
     }
@@ -972,6 +997,7 @@ fn sanitize_for_log(s: &str) -> Cow<'_, str> {
 )]
 mod tests {
     use super::*;
+    use crate::test_utils::capture_logs;
 
     fn test_filter(config: &serde_yaml::Value) -> AccessLogFilter {
         let cfg: AccessLogConfig = parse_filter_config("access_log", config).unwrap();
@@ -1810,36 +1836,6 @@ conditions:
     // Emission Shape
     // -------------------------------------------------------------------------
 
-    /// Capture `tracing` output emitted synchronously by `f` on this thread.
-    fn capture_logs<F: FnOnce()>(f: F) -> String {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone)]
-        struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Buffer {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("buffer lock").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
-        let writer = buffer.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = buffer.0.lock().expect("buffer lock").clone();
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-
     #[test]
     fn no_record_work_when_info_level_disabled() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("fields: [method, path, status]").unwrap();
@@ -2020,6 +2016,111 @@ conditions:
                 "a non-gRPC request must always log; a stray grpc-status must not enable sampling: {logged:?}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "health-based-failover")]
+    fn fallback_chain_token_parses() {
+        let token = parse_scalar_field_token("fallback_chain").unwrap();
+        assert!(matches!(token, FieldToken::FallbackChain), "got {token:?}");
+    }
+
+    #[test]
+    #[cfg(not(feature = "health-based-failover"))]
+    fn fallback_chain_token_requires_the_feature() {
+        let err = parse_scalar_field_token("fallback_chain").unwrap_err();
+        assert!(err.to_string().contains("unknown field token"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(feature = "health-based-failover")]
+    fn build_record_renders_the_fallback_chain() {
+        let plan = EmitPlan {
+            fields: vec![FieldToken::Cluster, FieldToken::FallbackChain],
+            is_default: false,
+        };
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(std::sync::Arc::from("primary"));
+        let direct = plan.build_record(&ctx, 200, None, 0);
+        assert_eq!(direct.get("cluster").map(String::as_str), Some("primary"));
+        assert_eq!(
+            direct.get("fallback_chain").map(String::as_str),
+            Some("-"),
+            "a request served by its routed cluster renders a dash"
+        );
+
+        fail_over(&mut ctx);
+        let failed_over = plan.build_record(&ctx, 200, None, 0);
+        assert_eq!(failed_over.get("cluster").map(String::as_str), Some("backup"));
+        assert_eq!(
+            failed_over.get("fallback_chain").map(String::as_str),
+            Some("primary,backup"),
+            "the walked chain runs from the routed cluster to the effective one"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "health-based-failover")]
+    fn default_record_logs_the_fallback_chain() {
+        let filter = test_filter(&serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+
+        let mut direct = crate::test_utils::make_filter_context(&req);
+        let logged = capture_logs(|| filter.maybe_emit(&mut direct, 200, None));
+        assert!(
+            logged.contains("fallback_chain=-"),
+            "no failover logs a dash: {logged:?}"
+        );
+
+        let mut failed_over = crate::test_utils::make_filter_context(&req);
+        fail_over(&mut failed_over);
+        let logged = capture_logs(|| filter.maybe_emit(&mut failed_over, 200, None));
+        assert!(
+            logged.contains(r#"cluster="backup""#) && logged.contains("fallback_chain=primary,backup"),
+            "the record names the effective cluster and the walked chain: {logged:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "health-based-failover")]
+    fn deferred_record_projects_the_fallback_chain() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("fields: [cluster, fallback_chain]").unwrap();
+        let filter = test_filter(&yaml);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        fail_over(&mut ctx);
+
+        let logged = capture_logs(|| {
+            assert!(filter.emit_deferred_record(&ctx, 502), "the filter claims the record");
+        });
+        assert!(
+            logged.contains(r#"record={"cluster":"backup","fallback_chain":"primary,backup"}"#),
+            "the projected deferred record carries the walked chain: {logged:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "health-based-failover")]
+    fn fallback_access_record_logs_the_fallback_chain() {
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        fail_over(&mut ctx);
+
+        let logged = capture_logs(|| emit_access_record(&ctx, 502));
+        assert!(
+            logged.contains(r#"cluster="backup""#) && logged.contains("fallback_chain=primary,backup"),
+            "the protocol-layer fallback record carries the walked chain: {logged:?}"
+        );
+    }
+
+    /// Record a failover from the routed `primary` to the effective `backup`.
+    #[cfg(feature = "health-based-failover")]
+    fn fail_over(ctx: &mut HttpFilterContext<'_>) {
+        ctx.cluster = Some(std::sync::Arc::from("backup"));
+        ctx.fallback_chain = Some(std::sync::Arc::from(
+            ["primary", "backup"].map(std::sync::Arc::<str>::from),
+        ));
     }
 
     fn grpc_request() -> crate::context::Request {

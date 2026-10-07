@@ -18,6 +18,10 @@ const CIRCUIT_BREAKER_OPEN: &str = "praxis_circuit_breaker_open";
 /// Counter for load-balancer panic-mode selections.
 const LB_PANIC_MODE_TOTAL: &str = "praxis_lb_panic_mode_total";
 
+/// Counter for load-balancer health-based fallback hops.
+#[cfg(feature = "health-based-failover")]
+const LB_FALLBACK_TOTAL: &str = "praxis_lb_fallback_total";
+
 #[cfg(feature = "cloud-events-filter")]
 /// Counter for `CloudEvents` publication outcomes.
 const CLOUD_EVENTS_PUBLISH_TOTAL: &str = "praxis_cloud_events_publish_total";
@@ -94,6 +98,16 @@ pub(crate) fn set_circuit_breaker_state(cluster_name: SharedString, open: bool) 
 /// Increment the load-balancer panic-mode counter for a cluster.
 pub(crate) fn record_lb_panic_mode(cluster: SharedString) {
     counter!(LB_PANIC_MODE_TOTAL, "cluster" => cluster).increment(1);
+}
+
+/// Increment the load-balancer health-based fallback counter for one walked
+/// hop, `from` the unhealthy cluster `to` the cluster it fell back to.
+///
+/// Emitted once per hop actually walked (a two-hop walk A -> B -> C emits
+/// two samples), not once per request or connection.
+#[cfg(feature = "health-based-failover")]
+pub(crate) fn record_lb_fallback(cluster: SharedString, fallback: SharedString) {
+    counter!(LB_FALLBACK_TOTAL, "cluster" => cluster, "fallback" => fallback).increment(1);
 }
 
 #[cfg(feature = "cloud-events-filter")]
@@ -206,6 +220,33 @@ mod tests {
         let rendered = crate::test_utils::render_metrics();
         assert_metric_labels(&rendered, "bound_phase_test", "request", "body");
         assert_metric_labels(&rendered, "bound_phase_test", "bound_upstream", "body");
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn record_lb_fallback_counts_each_hop_under_its_own_series() {
+        crate::test_utils::install_metrics_recorder();
+
+        record_lb_fallback(SharedString::from("metrics-hop-a"), SharedString::from("metrics-hop-b"));
+        record_lb_fallback(SharedString::from("metrics-hop-b"), SharedString::from("metrics-hop-c"));
+        record_lb_fallback(SharedString::from("metrics-hop-b"), SharedString::from("metrics-hop-c"));
+
+        let value = |labels: &str| crate::test_utils::metric_value(&format!("{LB_FALLBACK_TOTAL}{labels}"));
+        assert_eq!(
+            value(r#"{cluster="metrics-hop-a",fallback="metrics-hop-b"}"#).as_deref(),
+            Some("1"),
+            "the first hop is counted once under its own label pair"
+        );
+        assert_eq!(
+            value(r#"{cluster="metrics-hop-b",fallback="metrics-hop-c"}"#).as_deref(),
+            Some("2"),
+            "repeated hops accumulate on the same series"
+        );
+        assert_eq!(
+            value(r#"{cluster="metrics-hop-a",fallback="metrics-hop-c"}"#),
+            None,
+            "non-adjacent clusters never form a series"
+        );
     }
 
     #[test]

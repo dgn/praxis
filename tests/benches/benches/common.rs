@@ -39,6 +39,8 @@ pub(crate) fn make_ctx(req: &Request) -> HttpFilterContext<'_> {
         branch_iterations: std::collections::HashMap::new(),
         client_addr: None,
         cluster: None,
+        #[cfg(feature = "health-based-failover")]
+        fallback_chain: None,
         current_filter_id: None,
         downstream_tls: false,
         metrics_route: None,

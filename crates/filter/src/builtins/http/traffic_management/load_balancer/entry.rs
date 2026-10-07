@@ -49,6 +49,11 @@ pub(super) struct ClusterEntry {
     /// Opaque application provider tagged on the cluster, if any.
     pub(super) application_provider: Option<Arc<str>>,
 
+    /// Name of the cluster to fall back to when every endpoint in this
+    /// cluster is unhealthy. See [`crate::load_balancing::failover`].
+    #[cfg(feature = "health-based-failover")]
+    pub(super) fallback_cluster: Option<Arc<str>>,
+
     /// Resolved retry policy (legacy default when unset).
     pub(super) retry_policy: Arc<RetryPolicy>,
 
@@ -175,6 +180,8 @@ pub(super) fn build_cluster_entry(cluster: &Cluster) -> Result<ClusterEntry, Fil
         tls,
         application_protocol: cluster.http.application_protocol.clone(),
         application_provider: cluster.http.application_provider.clone(),
+        #[cfg(feature = "health-based-failover")]
+        fallback_cluster: cluster.fallback_cluster.clone(),
         retry_policy,
         retry_state,
         merged_retry_memo: ArcSwap::from_pointee(None),

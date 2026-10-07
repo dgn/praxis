@@ -12,7 +12,7 @@ For individual filter configurations, see the
 ```yaml
 listeners:             # Required. Named listeners to bind.
 filter_chains:         # Named, reusable filter chains.
-clusters:              # Optional. Standalone cluster defs (health checks).
+clusters:              # Optional. Standalone cluster defs (health checks / fallback registry).
 admin:                 # Optional. Admin health endpoint.
 body_limits:           # Optional. Global body size ceilings.
 metrics:               # Optional. Prometheus metric collection toggles.
@@ -114,6 +114,11 @@ rather than silently adopted as the baseline.
   listener. Its handler executes only filters of the
   protocol it was started with, so the reload is refused
   until the change is reverted or the process restarts.
+- With `health-based-failover`, any reload that breaks the
+  fallback health contract (for example a missing
+  top-level health declaration for an inline
+  `fallback_cluster` chain member, or mismatched endpoint
+  sets between the top-level and inline definitions).
 
 Stateful filters (rate limiter, circuit breaker) reset
 their state on reload. Operators should expect a brief
@@ -728,6 +733,23 @@ plaintext, so a top-level cluster's data-path settings
 (`tls`, `retry_policy`, the timeout fields,
 `load_balancer_strategy`) have no effect at all. Configure
 those on the inline load-balancer cluster instead.
+
+With the `health-based-failover` experimental build
+feature, `fallback_cluster` follows that same split:
+configure it only on an inline `load_balancer` or
+`tcp_load_balancer` `clusters:` entry, never on the
+top-level `clusters:` list. Every fallback-chain member,
+including the terminal one, must have a same-named
+top-level cluster with a `health_check` and an identical
+endpoint set, and fallback-chain members must not declare
+an inline `health_check` of their own. Once any inline
+cluster declares `fallback_cluster`, every inline
+definition of a health-checked name must also match its
+top-level endpoint set; configs without
+`fallback_cluster` validate as they do without the
+feature. See [Health Checking](health-checking.md) for
+the complete walk, sticky-session, bound-upstream,
+access-log, TCP ordering, and reload behavior.
 
 ## Failure Mode
 

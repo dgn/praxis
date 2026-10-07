@@ -53,6 +53,23 @@ pub(super) fn extract_lb_clusters(filters: &[PipelineFilter]) -> HashSet<String>
     out
 }
 
+/// Clusters that load balancers name as a `fallback_cluster` target,
+/// recursing into branch sub-chains.
+///
+/// Failover reaches such a cluster from its primary, so the unused-cluster
+/// warning counts it as referenced.
+#[cfg(feature = "health-based-failover")]
+pub(super) fn extract_fallback_clusters(filters: &[PipelineFilter]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for pf in filters {
+        out.extend(pf.filter.fallback_clusters());
+        for branch in &pf.branches {
+            out.extend(extract_fallback_clusters(&branch.filters));
+        }
+    }
+    out
+}
+
 /// Cluster names selected by this level's filters only (no branch recursion).
 ///
 /// Branch-level demands are checked per branch with that branch's own
@@ -357,6 +374,26 @@ mod tests {
         assert!(
             !clusters.contains("endpoint-only"),
             "a load balancer's cluster is not bindable: {clusters:?}"
+        );
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn extracts_fallback_clusters_including_branches() {
+        use crate::pipeline::test_filters::fallback_lb;
+
+        let filters = vec![
+            fallback_lb("load_balancer", &["primary", "backup"], &["backup"]),
+            host_with(
+                Some(cond()),
+                vec![fallback_lb("load_balancer", &["edge", "edge-backup"], &["edge-backup"])],
+            ),
+        ];
+
+        assert_eq!(
+            extract_fallback_clusters(&filters),
+            HashSet::from(["backup".to_owned(), "edge-backup".to_owned()]),
+            "fallback targets are collected at every level, conditional branches included"
         );
     }
 

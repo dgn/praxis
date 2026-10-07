@@ -51,6 +51,43 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNI_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
 
 // -----------------------------------------------------------------------------
+// TcpConnectEffective
+// -----------------------------------------------------------------------------
+
+/// Cluster selection resolved by connect filters, threaded into disconnect
+/// so cleanup, metrics, and logging attribute to the cluster that actually
+/// served the connection. With health-based failover that is the fallback
+/// cluster, not the listener's configured one.
+struct TcpConnectEffective {
+    /// Cluster selected by connect filters.
+    cluster: Option<Arc<str>>,
+
+    /// Fallback chain walked by connect filters, if failover occurred.
+    #[cfg(feature = "health-based-failover")]
+    fallback_chain: Option<Arc<[Arc<str>]>>,
+}
+
+impl TcpConnectEffective {
+    /// Move the cluster selection out of a connect-phase filter context.
+    fn take_from(ctx: &mut TcpFilterContext<'_>) -> Self {
+        Self {
+            cluster: ctx.cluster.take(),
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: ctx.fallback_chain.take(),
+        }
+    }
+
+    /// Cluster label for upstream connect metrics.
+    fn metrics_cluster_label(&self) -> ::metrics::SharedString {
+        self.cluster
+            .as_ref()
+            .map_or_else(crate::http::pingora::metrics::cluster_none, |c| {
+                ::metrics::SharedString::from(Arc::clone(c))
+            })
+    }
+}
+
+// -----------------------------------------------------------------------------
 // PingoraTcpProxy
 // -----------------------------------------------------------------------------
 
@@ -149,15 +186,6 @@ impl PingoraTcpProxy {
         )
     }
 
-    /// Cluster label for upstream connect metrics.
-    fn metrics_cluster_label(&self) -> ::metrics::SharedString {
-        self.cluster
-            .as_ref()
-            .map_or_else(crate::http::pingora::metrics::cluster_none, |c| {
-                ::metrics::SharedString::from(Arc::clone(c))
-            })
-    }
-
     /// Run bidirectional forwarding, returning the close reason.
     ///
     /// The reason lets the `connection_close` log distinguish a force-close
@@ -203,7 +231,8 @@ impl PingoraTcpProxy {
         }
     }
 
-    /// Run TCP connect filters; returns the resolved upstream address if allowed.
+    /// Run TCP connect filters; returns the resolved upstream address and
+    /// the effective cluster selection if allowed.
     #[expect(clippy::too_many_arguments, reason = "pipeline generation pinned by caller")]
     async fn run_connect_filters(
         &self,
@@ -212,7 +241,7 @@ impl PingoraTcpProxy {
         local_addr: &str,
         sni: Option<&str>,
         connect_time: std::time::Instant,
-    ) -> Option<String> {
+    ) -> Option<(String, TcpConnectEffective)> {
         let upstream_cow = self.upstream_addr.as_deref().map(Cow::Borrowed);
         let health_registry = pipeline.health_registry().cloned();
 
@@ -222,6 +251,8 @@ impl PingoraTcpProxy {
             sni,
             upstream_addr: upstream_cow,
             cluster: self.cluster.clone(),
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: health_registry.as_ref(),
             kv_stores: pipeline.kv_stores(),
             connect_time,
@@ -238,7 +269,7 @@ impl PingoraTcpProxy {
             );
             log_early_close(connect_time, "filter_rejection");
         }
-        result
+        result.map(|addr| (addr, TcpConnectEffective::take_from(&mut ctx)))
     }
 
     /// Run TCP disconnect filters for logging.
@@ -253,6 +284,7 @@ impl PingoraTcpProxy {
         connect_time: std::time::Instant,
         bytes_in: u64,
         bytes_out: u64,
+        effective: &TcpConnectEffective,
     ) {
         let health_registry = pipeline.health_registry().cloned();
         let mut ctx = TcpFilterContext {
@@ -260,7 +292,9 @@ impl PingoraTcpProxy {
             local_addr,
             sni: sni_hostname,
             upstream_addr: Some(Cow::Borrowed(upstream_addr)),
-            cluster: self.cluster.clone(),
+            cluster: effective.cluster.clone(),
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: effective.fallback_chain.clone(),
             health_registry: health_registry.as_ref(),
             kv_stores: pipeline.kv_stores(),
             connect_time,
@@ -349,7 +383,7 @@ impl ServerApp for PingoraTcpProxy {
             // stays on the same instance across a hot reload.
             let pipeline = self.pipeline.load_full();
 
-            let upstream_addr = self
+            let (upstream_addr, connect_effective) = self
                 .run_connect_filters(
                     &pipeline,
                     &remote_addr,
@@ -362,7 +396,7 @@ impl ServerApp for PingoraTcpProxy {
             Span::current().record("upstream.address", upstream_addr.as_str());
 
             let upstream_connect_start = std::time::Instant::now();
-            let cluster_label = self.metrics_cluster_label();
+            let cluster_label = connect_effective.metrics_cluster_label();
             let mut upstream =
                 if let Some(stream) = connect_upstream(&upstream_addr, self.allow_private_upstreams).await {
                     crate::http::pingora::metrics::record_upstream_connect_duration(
@@ -385,6 +419,7 @@ impl ServerApp for PingoraTcpProxy {
                         connect_time,
                         0,
                         0,
+                        &connect_effective,
                     )
                     .await;
                     super::metrics::record_tcp_connection_duration(
@@ -414,6 +449,7 @@ impl ServerApp for PingoraTcpProxy {
                     connect_time,
                     0,
                     0,
+                    &connect_effective,
                 )
                 .await;
                 super::metrics::record_tcp_connection_duration(
@@ -450,6 +486,7 @@ impl ServerApp for PingoraTcpProxy {
                 connect_time,
                 bytes_in,
                 bytes_out,
+                &connect_effective,
             )
             .await;
 
@@ -1177,6 +1214,8 @@ mod tests {
             sni: None,
             upstream_addr: None,
             cluster: Some(Arc::from(cluster)),
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: None,
             kv_stores: None,
             connect_time: std::time::Instant::now(),
@@ -1204,6 +1243,124 @@ mod tests {
             1,
             "a rejected connection must run the disconnect hook so the selected endpoint's in-flight counter is released"
         );
+    }
+
+    /// What each disconnect hook saw: the cluster and the rendered chain.
+    #[cfg(feature = "health-based-failover")]
+    type DisconnectLog = Arc<Mutex<Vec<(Option<String>, String)>>>;
+
+    /// Records the cluster and rendered fallback chain each disconnect hook
+    /// sees: `tcp_load_balancer` releases its in-flight counter on exactly
+    /// that cluster.
+    #[cfg(feature = "health-based-failover")]
+    struct DisconnectRecorder(DisconnectLog);
+
+    #[cfg(feature = "health-based-failover")]
+    #[async_trait]
+    impl praxis_filter::TcpFilter for DisconnectRecorder {
+        fn name(&self) -> &'static str {
+            "test_disconnect_recorder"
+        }
+
+        async fn on_disconnect(&self, ctx: &mut TcpFilterContext<'_>) -> Result<(), praxis_filter::FilterError> {
+            let cluster = ctx.cluster.as_deref().map(str::to_owned);
+            self.0.lock().unwrap().push((cluster, ctx.fallback_chain_field()));
+            Ok(())
+        }
+    }
+
+    /// A proxy for listener cluster `primary`, whose only endpoint is down,
+    /// so `tcp_load_balancer` fails over to `backup`. `tcp_access_log` and a
+    /// [`DisconnectRecorder`] run after the load balancer.
+    #[cfg(feature = "health-based-failover")]
+    fn failover_proxy(seen: &DisconnectLog) -> PingoraTcpProxy {
+        let mut entries: Vec<praxis_core::config::FilterEntry> = serde_yaml::from_str(
+            r#"
+- filter: tcp_load_balancer
+  clusters:
+    - name: primary
+      endpoints: ["10.0.0.1:5432"]
+      fallback_cluster: backup
+    - name: backup
+      endpoints: ["10.0.0.2:5432"]
+- filter: tcp_access_log
+- filter: test_disconnect_recorder
+"#,
+        )
+        .unwrap();
+        let seen = Arc::clone(seen);
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "test_disconnect_recorder",
+                praxis_filter::FilterFactory::Tcp(Arc::new(move |_config| {
+                    Ok(Box::new(DisconnectRecorder(Arc::clone(&seen))))
+                })),
+            )
+            .unwrap();
+        let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+        let primary = praxis_core::health::ClusterHealthEntry::new(
+            vec![praxis_core::health::EndpointHealth::new()],
+            vec![Arc::from("10.0.0.1:5432")],
+            None,
+            None,
+        );
+        primary.endpoints()[0].mark_unhealthy();
+        pipeline.set_health_registry(Arc::new(HashMap::from([(Arc::from("primary"), Arc::new(primary))])));
+        PingoraTcpProxy::new(
+            None,
+            Some(Arc::from("primary")),
+            Arc::new(ArcSwap::from_pointee(pipeline)),
+            None,
+            None,
+            None,
+            false,
+            HashMap::new(),
+            ::metrics::SharedString::from("tcp"),
+        )
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn connect_failure_runs_disconnect_hooks_on_the_fallback_cluster() {
+        let seen = Arc::default();
+        let proxy = Arc::new(failover_proxy(&seen));
+
+        let (_spans, events) = capture_tracing(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+                let (accepted, _peer) = listener.accept().await.unwrap();
+                // Not a TLS ClientHello, so the SNI peek ends after one read.
+                tokio::io::AsyncWriteExt::write_all(&mut client, b"plain text, not TLS\n")
+                    .await
+                    .unwrap();
+                let session: Stream = Box::new(pingora_core::protocols::l4::stream::Stream::from(accepted));
+                let (_shutdown_tx, shutdown) = watch::channel(false);
+                // Private upstreams are not allowed, so connecting to the
+                // fallback endpoint fails and takes the connect-failure exit.
+                assert!(proxy.process_new(session, &shutdown).await.is_none());
+            });
+        });
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(Some("backup".to_owned()), "primary,backup".to_owned())],
+            "the disconnect hooks that release the endpoint must see the fallback cluster"
+        );
+        let closed = events
+            .iter()
+            .find(|event| event.message == "TCP connection closed")
+            .expect("tcp_access_log should record the disconnect");
+        assert_eq!(
+            closed.fields.get("fallback_chain").map(String::as_str),
+            Some("primary,backup")
+        );
+        assert_eq!(closed.fields.get("upstream").map(String::as_str), Some("10.0.0.2:5432"));
     }
 
     #[test]

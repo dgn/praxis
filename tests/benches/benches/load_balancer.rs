@@ -113,5 +113,7 @@ fn make_cluster(strategy: LoadBalancerStrategy, n: usize) -> Cluster {
         tls: None,
         total_connection_timeout_ms: None,
         write_timeout_ms: None,
+        #[cfg(feature = "health-based-failover")]
+        fallback_cluster: None,
     }
 }

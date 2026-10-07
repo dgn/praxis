@@ -23,6 +23,7 @@ bound-upstream-request-body = ["praxis/bound-upstream-request-body"]
 spiffe = ["praxis/spiffe"]
 no-mac-cert-rotation-tests = []
 otel = ["praxis/otel"]
+health-based-failover = ["praxis/health-based-failover"]
 
 [lints]
 workspace = true

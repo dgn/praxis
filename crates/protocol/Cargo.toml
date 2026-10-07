@@ -38,6 +38,10 @@ spiffe = ["praxis-tls/spiffe"]
 # directly); one that does not simply leaves it off.
 policy-engine = ["praxis-filter/policy-engine"]
 
+# Per-cluster health-based failover. Off by default; experimental. The
+# `praxis-proxy` binary turns it on via its own feature.
+health-based-failover = ["praxis-filter/health-based-failover"]
+
 [lints]
 workspace = true
 

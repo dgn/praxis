@@ -97,6 +97,8 @@ pub(super) fn build_sub_filter_context<'a>(
         cluster_retry_state_released: false,
         endpoint_reselector: None,
         pinned_endpoint_address: None,
+        #[cfg(feature = "health-based-failover")]
+        fallback_chain: None,
         structured_metadata: HashMap::new(),
         subrequest_client: runtime.subrequest_client,
         subrequest_response_mode: SubRequestResponseMode::Buffered,

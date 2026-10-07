@@ -587,6 +587,406 @@ async fn on_request_errors_when_cluster_has_no_endpoints() {
 }
 
 // -----------------------------------------------------------------------------
+// Health-based failover tests
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "health-based-failover")]
+mod failover_tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::test_utils::{cluster_with_fallback, metric_value, multi_health_registry};
+
+    #[tokio::test]
+    async fn all_unhealthy_primary_fails_over_to_healthy_fallback() {
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("primary", &["127.0.0.1:8080"], "backup"),
+            test_cluster("backup", &["127.0.0.1:9090"]),
+        ]);
+        let registry = multi_health_registry(&[
+            ("primary", &["127.0.0.1:8080"], &[0]),
+            ("backup", &["127.0.0.1:9090"], &[]),
+        ]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("primary"));
+        ctx.health_registry = Some(&registry);
+
+        let action = lb.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("backup"),
+            "ctx.cluster should be the effective (fallback) cluster"
+        );
+        let chain = ctx.fallback_chain.as_ref().expect("fallback_chain should be set");
+        assert_eq!(
+            chain.as_ref(),
+            &[Arc::<str>::from("primary"), Arc::<str>::from("backup")]
+        );
+        let upstream = ctx.upstream.expect("upstream should be set from the fallback cluster");
+        assert_eq!(&*upstream.address, "127.0.0.1:9090");
+        assert_eq!(
+            ctx.selected_endpoint_index,
+            Some(0),
+            "selected_endpoint_index should resolve against the fallback cluster's own endpoints"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_primary_recovers_and_sets_no_fallback_chain() {
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("primary", &["127.0.0.1:8080"], "backup"),
+            test_cluster("backup", &["127.0.0.1:9090"]),
+        ]);
+        // Primary has at least one healthy endpoint, so no failover walk occurs.
+        let registry = multi_health_registry(&[("primary", &["127.0.0.1:8080"], &[])]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("primary"));
+        ctx.health_registry = Some(&registry);
+
+        drop(lb.on_request(&mut ctx).await.unwrap());
+
+        assert_eq!(ctx.cluster.as_deref(), Some("primary"));
+        assert!(
+            ctx.fallback_chain.is_none(),
+            "recovered primary should not report a fallback chain"
+        );
+        let upstream = ctx.upstream.expect("upstream should be set");
+        assert_eq!(&*upstream.address, "127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn two_unhealthy_tiers_land_on_third_cluster_with_full_chain() {
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("a", &["127.0.0.1:8080"], "b"),
+            cluster_with_fallback("b", &["127.0.0.1:8081"], "c"),
+            test_cluster("c", &["127.0.0.1:8082"]),
+        ]);
+        let registry = multi_health_registry(&[("a", &["127.0.0.1:8080"], &[0]), ("b", &["127.0.0.1:8081"], &[0])]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("a"));
+        ctx.health_registry = Some(&registry);
+
+        drop(lb.on_request(&mut ctx).await.unwrap());
+
+        assert_eq!(ctx.cluster.as_deref(), Some("c"));
+        let chain = ctx.fallback_chain.as_ref().expect("fallback_chain should be set");
+        assert_eq!(
+            chain.as_ref(),
+            &[Arc::<str>::from("a"), Arc::<str>::from("b"), Arc::<str>::from("c")]
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_chain_lands_on_last_cluster_for_panic_mode() {
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("panic-a", &["127.0.0.1:8080"], "panic-b"),
+            test_cluster("panic-b", &["127.0.0.1:8081", "127.0.0.1:8082"]),
+        ]);
+        // Both clusters are fully unhealthy; "panic-b" has no further fallback,
+        // so the walk stops there and panic mode selects among its endpoints.
+        let registry = multi_health_registry(&[
+            ("panic-a", &["127.0.0.1:8080"], &[0]),
+            ("panic-b", &["127.0.0.1:8081", "127.0.0.1:8082"], &[0, 1]),
+        ]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("panic-a"));
+        ctx.health_registry = Some(&registry);
+
+        crate::test_utils::install_metrics_recorder();
+        drop(lb.on_request(&mut ctx).await.unwrap());
+
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("panic-b"),
+            "panic mode selects from the last cluster in the chain, not the original primary"
+        );
+        assert!(ctx.upstream.is_some(), "panic mode should still select an upstream");
+        assert_eq!(
+            metric_value(r#"praxis_lb_panic_mode_total{cluster="panic-b"}"#).as_deref(),
+            Some("1"),
+            "panic-mode attribution should name the effective (last) cluster"
+        );
+        assert_eq!(
+            metric_value(r#"praxis_lb_panic_mode_total{cluster="panic-a"}"#),
+            None,
+            "the routed cluster is not attributed with panic mode"
+        );
+        assert_eq!(
+            metric_value(r#"praxis_lb_fallback_total{cluster="panic-a",fallback="panic-b"}"#).as_deref(),
+            Some("1"),
+            "the hop into the panicking tier is still counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_fallback_cluster_configured_behaves_like_before() {
+        let lb = LoadBalancerFilter::new(&[test_cluster("solo", &["127.0.0.1:8080"])]);
+        let registry = multi_health_registry(&[("solo", &["127.0.0.1:8080"], &[0])]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("solo"));
+        ctx.health_registry = Some(&registry);
+
+        drop(lb.on_request(&mut ctx).await.unwrap());
+
+        assert_eq!(ctx.cluster.as_deref(), Some("solo"));
+        assert!(ctx.fallback_chain.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_upstream_selection_is_not_substituted_when_its_cluster_is_all_down() {
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("explicit_primary", &["127.0.0.1:8080"], "explicit_backup"),
+            test_cluster("explicit_backup", &["127.0.0.1:9090"]),
+        ]);
+        let registry = multi_health_registry(&[("explicit_primary", &["127.0.0.1:8080"], &[0])]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("explicit_primary"));
+        ctx.health_registry = Some(&registry);
+        // An explicit endpoint_selector already set ctx.upstream before this
+        // filter runs.
+        ctx.upstream = Some(praxis_core::connectivity::Upstream {
+            address: Arc::from("127.0.0.1:8080"),
+            authority: None,
+            connection: Arc::new(praxis_core::connectivity::ConnectionOptions::default()),
+            tls: None,
+        });
+
+        crate::test_utils::install_metrics_recorder();
+        drop(lb.on_request(&mut ctx).await.unwrap());
+
+        assert_eq!(
+            &*ctx.upstream.expect("preset upstream should be preserved").address,
+            "127.0.0.1:8080",
+            "an explicit upstream selection must not be substituted by the fallback walk"
+        );
+        assert!(
+            ctx.fallback_chain.is_none(),
+            "no fallback chain should form when the upstream was already explicitly selected"
+        );
+        assert_eq!(
+            metric_value(r#"praxis_lb_fallback_total{cluster="explicit_primary",fallback="explicit_backup"}"#),
+            None,
+            "no fallback metric should be emitted for an explicit upstream selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_walked_hop_records_one_exact_metric_series() {
+        crate::test_utils::install_metrics_recorder();
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("lb-hop-a", &["127.0.0.1:8080"], "lb-hop-b"),
+            cluster_with_fallback("lb-hop-b", &["127.0.0.1:8081"], "lb-hop-c"),
+            test_cluster("lb-hop-c", &["127.0.0.1:8082"]),
+        ]);
+        let registry = multi_health_registry(&[
+            ("lb-hop-a", &["127.0.0.1:8080"], &[0]),
+            ("lb-hop-b", &["127.0.0.1:8081"], &[0]),
+        ]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("lb-hop-a"));
+        ctx.health_registry = Some(&registry);
+
+        drop(lb.on_request(&mut ctx).await.unwrap());
+
+        assert_eq!(
+            metric_value(r#"praxis_lb_fallback_total{cluster="lb-hop-a",fallback="lb-hop-b"}"#).as_deref(),
+            Some("1"),
+            "the first hop is counted once"
+        );
+        assert_eq!(
+            metric_value(r#"praxis_lb_fallback_total{cluster="lb-hop-b",fallback="lb-hop-c"}"#).as_deref(),
+            Some("1"),
+            "the second hop is counted once"
+        );
+        assert_eq!(
+            metric_value(r#"praxis_lb_fallback_total{cluster="lb-hop-a",fallback="lb-hop-c"}"#),
+            None,
+            "only adjacent clusters form a hop series"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_state_and_release_follow_the_fallback_cluster() {
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("primary", &["127.0.0.1:8080"], "backup"),
+            cluster_with_strategy(
+                "backup",
+                &["127.0.0.1:9090"],
+                LoadBalancerStrategy::Simple(SimpleStrategy::LeastConnections),
+            ),
+        ]);
+        let registry = multi_health_registry(&[("primary", &["127.0.0.1:8080"], &[0])]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("primary"));
+        ctx.health_registry = Some(&registry);
+        let (primary, backup) = (&lb.clusters["primary"], &lb.clusters["backup"]);
+
+        drop(lb.on_request(&mut ctx).await.unwrap());
+
+        assert_eq!(
+            least_connections_load(&lb, "backup", "127.0.0.1:9090"),
+            Some(1),
+            "the fallback endpoint is counted in flight"
+        );
+        assert!(
+            ctx.cluster_retry_state
+                .as_ref()
+                .is_some_and(|state| Arc::ptr_eq(state, &backup.retry_state)),
+            "the retry budget is tracked against the fallback cluster"
+        );
+        assert!(
+            ctx.retry_policy.as_ref().is_some_and(
+                |policy| Arc::ptr_eq(policy, &backup.retry_policy) && !Arc::ptr_eq(policy, &primary.retry_policy)
+            ),
+            "the fallback cluster's retry policy applies"
+        );
+        assert_eq!(backup.retry_state.active_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            primary.retry_state.active_requests.load(Ordering::Relaxed),
+            0,
+            "the unhealthy routed cluster carries no in-flight request"
+        );
+
+        drop(lb.on_response(&mut ctx).await.unwrap());
+
+        assert_eq!(
+            least_connections_load(&lb, "backup", "127.0.0.1:9090"),
+            Some(0),
+            "on_response releases the endpoint on the fallback cluster"
+        );
+        assert_eq!(
+            backup.retry_state.active_requests.load(Ordering::Relaxed),
+            0,
+            "on_response leaves the fallback cluster's retry state"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_fallback_chain_is_cleared_when_the_routed_cluster_is_healthy() {
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("primary", &["127.0.0.1:8080"], "backup"),
+            test_cluster("backup", &["127.0.0.1:9090"]),
+        ]);
+        let registry = multi_health_registry(&[("primary", &["127.0.0.1:8080"], &[])]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("primary"));
+        ctx.health_registry = Some(&registry);
+        ctx.fallback_chain = Some(Arc::from([Arc::<str>::from("stale-a"), Arc::from("stale-b")]));
+
+        drop(lb.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.fallback_chain.is_none(),
+            "a chain left by an earlier selection must not describe this one"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_drops_an_endpoint_pinned_against_the_routed_cluster() {
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("primary", &["127.0.0.1:8080"], "backup"),
+            test_cluster("backup", &["127.0.0.1:9090"]),
+        ]);
+        // The fallback has no health entry, so a kept pin would be honored
+        // verbatim and send the request back to the down primary endpoint.
+        let registry = multi_health_registry(&[("primary", &["127.0.0.1:8080"], &[0])]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("primary"));
+        ctx.health_registry = Some(&registry);
+        ctx.pinned_endpoint_address = Some(Arc::from("127.0.0.1:8080"));
+
+        drop(lb.on_request(&mut ctx).await.unwrap());
+
+        assert_eq!(
+            &*ctx.upstream.as_ref().expect("an upstream is selected").address,
+            "127.0.0.1:9090",
+            "the endpoint comes from the fallback cluster, not the stale pin"
+        );
+        assert!(ctx.pinned_endpoint_address.is_none(), "the stale pin is consumed");
+    }
+
+    #[test]
+    fn fallback_clusters_lists_declared_targets() {
+        let lb = LoadBalancerFilter::new(&[
+            cluster_with_fallback("primary", &["127.0.0.1:8080"], "backup"),
+            test_cluster("backup", &["127.0.0.1:9090"]),
+        ]);
+
+        assert_eq!(lb.fallback_clusters(), vec!["backup".to_owned()]);
+    }
+
+    #[cfg(feature = "upstream-binding")]
+    #[tokio::test]
+    async fn bound_upstream_failover_keeps_the_frozen_binding_and_is_not_rerun() {
+        crate::test_utils::install_metrics_recorder();
+        let lb = LoadBalancerFilter::try_new_with_source(
+            &[
+                cluster_with_fallback("bound-primary", &["127.0.0.1:8080"], "bound-backup"),
+                test_cluster("bound-backup", &["127.0.0.1:9090"]),
+            ],
+            super::super::ClusterSource::BoundUpstream,
+        )
+        .expect("a valid bound-source load balancer builds");
+        let registry = multi_health_registry(&[("bound-primary", &["127.0.0.1:8080"], &[0])]);
+        let req = crate::test_utils::make_request(http::Method::GET, "/");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.publish_bound_upstream(Arc::from("bound-primary"), None, None)
+            .expect("publish before freeze succeeds");
+        ctx.health_registry = Some(&registry);
+        let hop = r#"praxis_lb_fallback_total{cluster="bound-primary",fallback="bound-backup"}"#;
+
+        drop(
+            lb.on_request(&mut ctx)
+                .await
+                .expect("bound failover selects an endpoint"),
+        );
+
+        assert_eq!(
+            ctx.bound_cluster(),
+            Some("bound-primary"),
+            "the frozen logical binding keeps the routed cluster"
+        );
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("bound-backup"),
+            "selection, logs, and release key off the effective cluster"
+        );
+        let chain = ctx.fallback_chain.as_ref().expect("fallback_chain should be set");
+        assert_eq!(
+            chain.as_ref(),
+            &[Arc::<str>::from("bound-primary"), Arc::<str>::from("bound-backup")]
+        );
+        assert_eq!(metric_value(hop).as_deref(), Some("1"), "the hop is counted once");
+
+        drop(
+            lb.on_request(&mut ctx)
+                .await
+                .expect("re-running after selection is a no-op, not a bound-cluster conflict"),
+        );
+
+        assert_eq!(
+            &*ctx.upstream.as_ref().expect("the upstream is kept").address,
+            "127.0.0.1:9090"
+        );
+        assert_eq!(ctx.cluster.as_deref(), Some("bound-backup"));
+        assert!(ctx.fallback_chain.is_some(), "the selected chain is kept");
+        assert_eq!(metric_value(hop).as_deref(), Some("1"), "the hop is not counted twice");
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Selected Cluster Application Tests
 // -----------------------------------------------------------------------------
 
@@ -1530,7 +1930,7 @@ fn cluster_with_strategy(name: &str, endpoints: &[&str], strategy: LoadBalancerS
     }
 }
 
-#[cfg(feature = "upstream-binding")]
+#[cfg(any(feature = "upstream-binding", feature = "health-based-failover"))]
 /// In-flight count the least-connections strategy tracks for `endpoint` in
 /// `cluster`, or `None` when the cluster is unknown or uses another strategy.
 fn least_connections_load(lb: &LoadBalancerFilter, cluster: &str, endpoint: &str) -> Option<usize> {

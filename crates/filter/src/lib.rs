@@ -255,6 +255,8 @@ pub(crate) mod test_utils {
             cluster_retry_state_released: false,
             endpoint_reselector: None,
             pinned_endpoint_address: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             time_source: &praxis_core::time::SystemTimeSource,
             upstream: None,
         }
@@ -289,5 +291,96 @@ pub(crate) mod test_utils {
     #[cfg(test)]
     pub(crate) fn render_metrics() -> String {
         install_metrics_recorder().render()
+    }
+
+    /// Capture `tracing` output emitted synchronously by `f` on this thread.
+    #[cfg(test)]
+    pub(crate) fn capture_logs<F: FnOnce()>(f: F) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("buffer lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buffer.0.lock().expect("buffer lock").clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The rendered value of exactly the Prometheus series `series` (metric
+    /// name plus full label set, e.g. `name{label="v"}`), if recorded.
+    #[cfg(all(test, feature = "health-based-failover"))]
+    pub(crate) fn metric_value(series: &str) -> Option<String> {
+        render_metrics()
+            .lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ').map(str::to_owned))
+    }
+
+    /// One cluster's health fixture: name, endpoint addresses, and the
+    /// indices of the endpoints to mark unhealthy.
+    #[cfg(all(test, feature = "health-based-failover"))]
+    pub(crate) type HealthFixture<'a> = (&'a str, &'a [&'a str], &'a [usize]);
+
+    /// Build a [`HealthRegistry`] covering several clusters at once.
+    ///
+    /// [`HealthRegistry`]: praxis_core::health::HealthRegistry
+    #[cfg(all(test, feature = "health-based-failover"))]
+    pub(crate) fn multi_health_registry(clusters: &[HealthFixture<'_>]) -> praxis_core::health::HealthRegistry {
+        use std::sync::Arc;
+
+        use praxis_core::health::{ClusterHealthEntry, EndpointHealth};
+
+        let map = clusters
+            .iter()
+            .map(|(name, endpoints, unhealthy)| {
+                let entry = Arc::new(ClusterHealthEntry::new(
+                    endpoints.iter().map(|_| EndpointHealth::new()).collect(),
+                    endpoints.iter().map(|addr| Arc::from(*addr)).collect(),
+                    None,
+                    None,
+                ));
+                for index in *unhealthy {
+                    entry
+                        .endpoints()
+                        .get(*index)
+                        .expect("unhealthy index in range")
+                        .mark_unhealthy();
+                }
+                (Arc::from(*name), entry)
+            })
+            .collect();
+        Arc::new(map)
+    }
+
+    /// Build a [`Cluster`] whose `fallback_cluster` is `fallback`.
+    ///
+    /// [`Cluster`]: praxis_core::config::Cluster
+    #[cfg(all(test, feature = "health-based-failover"))]
+    pub(crate) fn cluster_with_fallback(
+        name: &str,
+        endpoints: &[&str],
+        fallback: &str,
+    ) -> praxis_core::config::Cluster {
+        praxis_core::config::Cluster {
+            fallback_cluster: Some(std::sync::Arc::from(fallback)),
+            ..praxis_core::config::Cluster::with_defaults(name, endpoints.iter().map(|s| (*s).into()).collect())
+        }
     }
 }

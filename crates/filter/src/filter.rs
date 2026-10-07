@@ -124,6 +124,16 @@ pub trait HttpFilter: Send + Sync {
         Vec::new()
     }
 
+    /// The `fallback_cluster` targets this filter can fail over to.
+    ///
+    /// Load-balancing filters override this so validation counts those
+    /// clusters as referenced even though no cluster-selecting filter names
+    /// them.
+    #[cfg(feature = "health-based-failover")]
+    fn fallback_clusters(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Application metadata for the clusters this filter declares.
     ///
     /// The pipeline folds every filter's declarations into a single

@@ -113,6 +113,8 @@ impl FilteredStreamingBody {
                 cluster_retry_state_released: false,
                 endpoint_reselector: None,
                 pinned_endpoint_address: None,
+                #[cfg(feature = "health-based-failover")]
+                fallback_chain: None,
                 session_stores: cont.pipeline.session_stores(),
                 structured_metadata: std::mem::take(&mut cont.structured_metadata),
                 subrequest_client: cont.pipeline.subrequest_client(),

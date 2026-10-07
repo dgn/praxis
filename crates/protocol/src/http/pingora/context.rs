@@ -12,6 +12,40 @@ use tokio::sync::OwnedSemaphorePermit;
 use tracing::Span;
 
 // -----------------------------------------------------------------------------
+// fallback_chain helpers
+// -----------------------------------------------------------------------------
+
+/// Take the walked fallback chain out of an
+/// [`HttpFilterContext`](praxis_filter::HttpFilterContext) so the phase can
+/// restore it with [`write_back_fallback_chain`] once the filters have run.
+///
+/// Every phase write-back goes through this pair: the signatures are the
+/// same in both feature states, so call sites need no `#[cfg]`.
+#[cfg(feature = "health-based-failover")]
+pub(crate) fn take_fallback_chain(fctx: &mut praxis_filter::HttpFilterContext<'_>) -> Option<Arc<[Arc<str>]>> {
+    std::mem::take(&mut fctx.fallback_chain)
+}
+
+/// Feature-off stand-in for [`take_fallback_chain`]: there is no chain to
+/// take, so this always returns `None`.
+#[cfg(not(feature = "health-based-failover"))]
+pub(crate) fn take_fallback_chain(_fctx: &mut praxis_filter::HttpFilterContext<'_>) -> Option<Arc<[Arc<str>]>> {
+    None
+}
+
+/// Write a previously-taken fallback chain back onto `ctx`, pairing with
+/// [`take_fallback_chain`].
+#[cfg(feature = "health-based-failover")]
+pub(crate) fn write_back_fallback_chain(ctx: &mut PingoraRequestCtx, fallback_chain: Option<Arc<[Arc<str>]>>) {
+    ctx.fallback_chain = fallback_chain;
+}
+
+/// Feature-off stand-in for [`write_back_fallback_chain`]: a no-op, since
+/// `PingoraRequestCtx` has no `fallback_chain` field.
+#[cfg(not(feature = "health-based-failover"))]
+pub(crate) fn write_back_fallback_chain(_ctx: &mut PingoraRequestCtx, _fallback_chain: Option<Arc<[Arc<str>]>>) {}
+
+// -----------------------------------------------------------------------------
 // PingoraRequestCtx
 // -----------------------------------------------------------------------------
 
@@ -50,6 +84,13 @@ pub struct PingoraRequestCtx {
 
     /// Name of the cluster selected by a cluster-selecting filter.
     pub cluster: Option<Arc<str>>,
+
+    /// Ordered cluster names walked by health-based failover for this
+    /// request. See [`HttpFilterContext::fallback_chain`].
+    ///
+    /// [`HttpFilterContext::fallback_chain`]: praxis_filter::HttpFilterContext::fallback_chain
+    #[cfg(feature = "health-based-failover")]
+    pub fallback_chain: Option<Arc<[Arc<str>]>>,
 
     /// Cached per-filter body-done indices. Swapped into each
     /// [`HttpFilterContext`] and written back after execution.
@@ -402,6 +443,8 @@ macro_rules! filter_context {
             branch_iterations: std::collections::HashMap::new(),
             client_addr: $ctx.client_addr,
             cluster: $ctx.cluster.take(),
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: $ctx.fallback_chain.take(),
             current_filter_id: None,
             downstream_tls: $ctx.downstream_tls,
             metrics_route: $ctx.metrics_route.clone(),
@@ -593,6 +636,8 @@ impl Default for PingoraRequestCtx {
             client_addr: None,
             client_http_version: None,
             cluster: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             connection_upgraded: false,
             downstream_tls: false,
             peer_identity: None,
@@ -685,6 +730,15 @@ mod tests {
     fn default_state_has_no_cluster() {
         let ctx = default_ctx();
         assert!(ctx.cluster.is_none(), "default cluster should be None");
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn default_state_has_no_fallback_chain() {
+        // Pingora's `new_ctx` builds every request's context from `Default`,
+        // so the next request on a keep-alive connection starts without one.
+        let ctx = default_ctx();
+        assert!(ctx.fallback_chain.is_none(), "default fallback_chain should be None");
     }
 
     #[test]

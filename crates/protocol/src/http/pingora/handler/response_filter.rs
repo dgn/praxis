@@ -16,7 +16,10 @@ use praxis_filter::{FilterAction, FilterPipeline};
 use tracing::{debug, error, warn};
 
 use super::{
-    super::{context::PingoraRequestCtx, convert::response_header_from_pingora},
+    super::{
+        context::{PingoraRequestCtx, take_fallback_chain, write_back_fallback_chain},
+        convert::response_header_from_pingora,
+    },
     body_util::clamp_body_mode_to_ceiling,
     hop_by_hop::{self, RemoveHeader as _},
     retry_util::maybe_retry_response,
@@ -123,6 +126,7 @@ async fn run_response_pipeline(
         headers_modified,
         response_body_mode,
         cluster,
+        fallback_chain,
         cluster_retry_state_released,
         extensions,
         filter_metadata,
@@ -139,11 +143,13 @@ async fn run_response_pipeline(
             )
         })?;
         let r = pipeline.execute_http_response(&mut fctx).await;
+        let fallback_chain = take_fallback_chain(&mut fctx);
         (
             r,
             fctx.response_headers_modified,
             fctx.response_body_mode,
             fctx.cluster,
+            fallback_chain,
             fctx.cluster_retry_state_released,
             fctx.extensions,
             fctx.filter_metadata,
@@ -155,6 +161,7 @@ async fn run_response_pipeline(
         )
     };
     ctx.cluster = cluster;
+    write_back_fallback_chain(ctx, fallback_chain);
     ctx.cluster_retry_state_released = cluster_retry_state_released;
     ctx.response_body_mode = clamp_body_mode_to_ceiling(response_body_mode, baseline_response_body_mode);
     ctx.extensions = extensions;
@@ -379,6 +386,27 @@ mod tests {
         execute(&pipeline, &mut upstream_response, &mut ctx).await.unwrap();
 
         assert_eq!(upstream_response.status, 404);
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[tokio::test]
+    async fn response_phase_writes_back_fallback_chain() {
+        use std::sync::Arc;
+
+        let pipeline = make_pipeline();
+        let mut upstream_response = pingora_http::ResponseHeader::build(200, None).unwrap();
+        let mut ctx = make_ctx();
+        ctx.fallback_chain = Some(Arc::from(["primary", "secondary"].map(Arc::<str>::from)));
+
+        execute(&pipeline, &mut upstream_response, &mut ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.filter_context_for(&pipeline, None)
+                .expect("snapshot is present")
+                .fallback_chain_field(),
+            "primary,secondary",
+            "the body, trailer and logging phases must still see the walked chain after the response hook"
+        );
     }
 
     #[tokio::test]

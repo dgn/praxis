@@ -3,6 +3,24 @@
 
 //! Built-in filter implementations, organized by protocol and category.
 
+/// `tracing::info!` with the access-log `fallback_chain` field appended
+/// after `$fields` (rendered by `$ctx.fallback_chain_field()`).
+#[cfg(feature = "health-based-failover")]
+macro_rules! info_with_fallback_chain {
+    ($ctx:ident, { $($fields:tt)* }, $message:literal) => {
+        ::tracing::info!($($fields)* fallback_chain = %$ctx.fallback_chain_field(), $message)
+    };
+}
+
+/// `tracing::info!` over `$fields`; the `fallback_chain` field only exists
+/// with the `health-based-failover` build feature.
+#[cfg(not(feature = "health-based-failover"))]
+macro_rules! info_with_fallback_chain {
+    ($ctx:ident, { $($fields:tt)* }, $message:literal) => {
+        ::tracing::info!($($fields)* $message)
+    };
+}
+
 pub mod http;
 mod tcp;
 

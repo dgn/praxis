@@ -99,4 +99,5 @@ harness = false
 [features]
 policy-engine = ["praxis-filter/policy-engine"]
 upstream-binding = ["praxis-filter/upstream-binding"]
+health-based-failover = ["praxis-filter/health-based-failover"]
 dhat-heap = ["dep:dhat"]

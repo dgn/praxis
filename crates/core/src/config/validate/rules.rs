@@ -93,6 +93,8 @@ impl Config {
         validate_clusters(&self.clusters, &self.insecure_options)?;
         validate_inline_clusters(&self.filter_chains, &self.insecure_options)?;
         validate_tcp_listener_clusters(&self.listeners, &self.filter_chains)?;
+        #[cfg(feature = "health-based-failover")]
+        super::fallback::validate_failover(self)?;
         validate_selected_upstream_matchers(&self.filter_chains, &self.clusters)?;
         self.validate_runtime()?;
         validate_shutdown_timeout(self.shutdown_timeout_secs)?;

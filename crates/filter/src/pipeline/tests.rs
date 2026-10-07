@@ -2016,6 +2016,90 @@ fn build_with_chains_rejects_branch_chains_on_a_tcp_filter() {
     );
 }
 
+/// Whether `errors` holds the TCP access-log ordering error.
+#[cfg(feature = "health-based-failover")]
+fn has_tcp_access_log_ordering_error(errors: &[String]) -> bool {
+    errors
+        .iter()
+        .any(|e| e.contains("tcp_access_log must appear after a tcp_load_balancer"))
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn errors_tcp_access_log_before_failover_tcp_load_balancer() {
+    let registry = FilterRegistry::with_builtins();
+    let mut entries = vec![tcp_access_log_entry(), tcp_failover_load_balancer_entry()];
+    let pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+    let errors = pipeline.ordering_errors(&entries, false, &SkipPipelineChecks::default());
+    assert!(
+        has_tcp_access_log_ordering_error(&errors),
+        "tcp_access_log before a fallback-declaring tcp_load_balancer should error: {errors:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn accepts_tcp_access_log_after_failover_tcp_load_balancer() {
+    let registry = FilterRegistry::with_builtins();
+    let mut entries = vec![tcp_failover_load_balancer_entry(), tcp_access_log_entry()];
+    let pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+    let errors = pipeline.ordering_errors(&entries, false, &SkipPipelineChecks::default());
+    assert!(
+        !has_tcp_access_log_ordering_error(&errors),
+        "tcp_access_log after the fallback-declaring tcp_load_balancer should be accepted: {errors:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn accepts_tcp_access_log_before_tcp_load_balancer_without_fallback() {
+    let registry = FilterRegistry::with_builtins();
+    let mut entries = vec![tcp_access_log_entry(), tcp_load_balancer_entry()];
+    let pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+    let errors = pipeline.ordering_errors(&entries, false, &SkipPipelineChecks::default());
+    assert!(
+        !has_tcp_access_log_ordering_error(&errors),
+        "enabling the feature must not restrict pipelines that declare no fallback_cluster: {errors:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn accepts_tcp_access_log_without_tcp_load_balancer() {
+    let registry = FilterRegistry::with_builtins();
+    let mut entries = vec![tcp_access_log_entry()];
+    let pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+    let errors = pipeline.ordering_errors(&entries, false, &SkipPipelineChecks::default());
+    assert!(
+        !has_tcp_access_log_ordering_error(&errors),
+        "a static-upstream-only TCP listener with no tcp_load_balancer is unrestricted: {errors:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn fallback_only_clusters_are_not_reported_as_unreferenced() {
+    use crate::pipeline::test_filters::{fallback_lb, selector_filter};
+
+    let filters = vec![
+        selector_filter("router", &["primary"]),
+        fallback_lb("load_balancer", &["primary", "backup", "orphan"], &["backup"]),
+    ];
+
+    let logs = crate::test_utils::capture_logs(|| {
+        super::checks::check_misaligned_clusters(&filters, &mut Vec::new());
+    });
+
+    assert!(
+        logs.contains("cluster=orphan"),
+        "a cluster nothing selects or falls back to is still reported: {logs}"
+    );
+    assert!(
+        !logs.contains("cluster=backup"),
+        "a cluster reached only as a fallback_cluster target is referenced: {logs}"
+    );
+}
+
 #[test]
 fn errors_conditional_security_filter_in_branch_chain() {
     let registry = FilterRegistry::with_builtins();
@@ -5399,6 +5483,46 @@ fn tcp_access_log_entry() -> FilterEntry {
         response_conditions: vec![],
         name: None,
         failure_mode: FailureMode::default(),
+    }
+}
+
+/// A `tcp_load_balancer` filter entry with a single cluster.
+#[cfg(feature = "health-based-failover")]
+fn tcp_load_balancer_entry() -> FilterEntry {
+    FilterEntry {
+        branch_chains: None,
+        filter_type: "tcp_load_balancer".into(),
+        config: serde_yaml::from_str(
+            r#"
+clusters:
+  - name: "db"
+    endpoints: ["10.0.0.1:5432"]
+"#,
+        )
+        .unwrap(),
+        conditions: vec![],
+        response_conditions: vec![],
+        name: None,
+        failure_mode: FailureMode::default(),
+    }
+}
+
+/// A `tcp_load_balancer` entry whose `db` cluster fails over to `db-backup`.
+#[cfg(feature = "health-based-failover")]
+fn tcp_failover_load_balancer_entry() -> FilterEntry {
+    FilterEntry {
+        config: serde_yaml::from_str(
+            r#"
+clusters:
+  - name: "db"
+    endpoints: ["10.0.0.1:5432"]
+    fallback_cluster: "db-backup"
+  - name: "db-backup"
+    endpoints: ["10.0.0.2:5432"]
+"#,
+        )
+        .unwrap(),
+        ..tcp_load_balancer_entry()
     }
 }
 

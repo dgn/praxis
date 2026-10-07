@@ -189,6 +189,8 @@ pub(crate) fn resolve_pipelines_with_composition(
         .iter()
         .map(|chain| (chain.name.as_str(), chain.filters.as_slice()))
         .collect();
+    #[cfg(feature = "health-based-failover")]
+    let health_contract = praxis_core::config::FallbackHealthContract::from_config(config)?;
     let mut pipelines = HashMap::with_capacity(config.listeners.len());
     for listener in &config.listeners {
         let mut entries = Vec::new();
@@ -209,8 +211,17 @@ pub(crate) fn resolve_pipelines_with_composition(
         // the full configuration or conditional filters and branch chains would
         // appear absent.
         let entry_snapshot = entries.clone();
+        #[cfg(not(feature = "health-based-failover"))]
         let mut pipeline =
             FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
+        #[cfg(feature = "health-based-failover")]
+        let mut pipeline = FilterPipeline::build_with_chains_and_health_contract(
+            &mut entries,
+            registry,
+            &chains,
+            &config.insecure_options,
+            &health_contract,
+        )?;
         configure_pipeline(
             &mut pipeline,
             config,

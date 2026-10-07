@@ -677,6 +677,8 @@ default_upstream: "10.0.0.1:443"
             sni,
             upstream_addr: None,
             cluster: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: None,
             kv_stores: None,
             connect_time: Instant::now(),

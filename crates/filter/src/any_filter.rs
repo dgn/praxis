@@ -87,6 +87,15 @@ impl AnyFilter {
         }
     }
 
+    /// The `fallback_cluster` targets this filter can fail over to.
+    #[cfg(feature = "health-based-failover")]
+    pub fn fallback_clusters(&self) -> Vec<String> {
+        match self {
+            Self::Http(f) => f.fallback_clusters(),
+            Self::Tcp(f) => f.fallback_clusters(),
+        }
+    }
+
     /// Whether the filter selects its target cluster from the frozen logical
     /// binding rather than a preceding router (a `cluster_source:
     /// bound_upstream` load balancer). TCP filters never do.
