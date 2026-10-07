@@ -29,6 +29,10 @@ fn all_example_configs_parse() {
         if entry.file_name().is_some_and(|n| n == "slow-start.yaml") {
             continue;
         }
+        #[cfg(not(feature = "health-based-failover"))]
+        if entry.file_name().is_some_and(|n| n == "health-based-failover.yaml") {
+            continue;
+        }
         Config::from_file(&entry).unwrap_or_else(|e| panic!("{}: {e}", entry.display()));
         count += 1;
     }

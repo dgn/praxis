@@ -7,7 +7,7 @@ use bytes::Bytes;
 use praxis_filter::FilterPipeline;
 use tracing::debug;
 
-use crate::http::pingora::context::PingoraRequestCtx;
+use crate::http::pingora::context::{PingoraRequestCtx, take_fallback_chain, write_back_fallback_chain};
 
 /// Run the pipeline's response-trailer filters.
 ///
@@ -23,7 +23,10 @@ pub(super) fn execute(
     let produced = pipeline.execute_http_response_trailers(&mut filter_ctx, trailers);
 
     // Write back the durable channels, as every other phase does, so a
-    // filter's metadata survives into the logging phase.
+    // filter's metadata and the routed cluster survive into the logging
+    // phase, where a complete gRPC call's deferred access record is built.
+    let cluster = filter_ctx.cluster.take();
+    let fallback_chain = take_fallback_chain(&mut filter_ctx);
     let extensions = std::mem::take(&mut filter_ctx.extensions);
     let metadata = std::mem::take(&mut filter_ctx.filter_metadata);
     let structured = std::mem::take(&mut filter_ctx.structured_metadata);
@@ -32,6 +35,8 @@ pub(super) fn execute(
     let executed = std::mem::take(&mut filter_ctx.executed_filter_indices);
     let body_done = std::mem::take(&mut filter_ctx.body_done_indices);
     drop(filter_ctx);
+    ctx.cluster = cluster;
+    write_back_fallback_chain(ctx, fallback_chain);
     ctx.extensions = extensions;
     ctx.filter_metadata = metadata;
     ctx.structured_metadata = structured;
@@ -65,6 +70,8 @@ pub(super) fn execute(
     reason = "tests"
 )]
 mod tests {
+    use std::sync::Arc;
+
     use praxis_filter::{FilterRegistry, Request};
 
     use super::*;
@@ -193,6 +200,46 @@ mod tests {
         assert!(
             ctx.structured_metadata.contains_key("namespace"),
             "structured_metadata should survive writeback"
+        );
+    }
+
+    #[test]
+    fn execute_writes_back_cluster() {
+        let pipeline = make_test_pipeline();
+        let mut ctx = make_test_context();
+        ctx.request_snapshot = Some(make_request_snapshot());
+        ctx.cluster = Some(Arc::from("backend"));
+
+        let mut trailers = http::HeaderMap::new();
+        let result = execute(&pipeline, &mut trailers, &mut ctx);
+
+        assert!(result.is_none());
+        let logged = ctx.filter_context_for(&pipeline, None).expect("snapshot is present");
+        assert_eq!(
+            logged.cluster_name(),
+            Some("backend"),
+            "the logging phase must still see the routed cluster after the trailer hook"
+        );
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn execute_writes_back_fallback_chain() {
+        let pipeline = make_test_pipeline();
+        let mut ctx = make_test_context();
+        ctx.request_snapshot = Some(make_request_snapshot());
+        ctx.cluster = Some(Arc::from("secondary"));
+        ctx.fallback_chain = Some(Arc::from([Arc::from("primary"), Arc::from("secondary")]));
+
+        let mut trailers = http::HeaderMap::new();
+        let result = execute(&pipeline, &mut trailers, &mut ctx);
+
+        assert!(result.is_none());
+        let logged = ctx.filter_context_for(&pipeline, None).expect("snapshot is present");
+        assert_eq!(
+            logged.fallback_chain_field(),
+            "primary,secondary",
+            "the deferred access record must still see the walked chain after the trailer hook"
         );
     }
 

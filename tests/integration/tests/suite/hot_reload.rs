@@ -212,6 +212,37 @@ fn reload_recovers_after_invalid_then_valid() {
     assert_eq!(body, "v2", "should recover and serve v2 after valid config");
 }
 
+#[cfg(feature = "health-based-failover")]
+#[test]
+fn reload_invalid_fallback_cluster_keeps_old_failover() {
+    use praxis_test_utils::net::backend::start_health_toggle_backend;
+
+    let primary = start_health_toggle_backend("/healthz", "primary");
+    let backup = start_health_toggle_backend("/healthz", "backup");
+    let proxy_port = free_port();
+
+    let proxy = start_reloadable_proxy(&failover_yaml(proxy_port, primary.port(), backup.port(), "backup"));
+
+    let (status, body) = get_eventually(proxy.addr(), "/", |code, b| code == 200 && b == "primary");
+    assert_eq!((status, body.as_str()), (200, "primary"), "the healthy primary serves");
+
+    // Swapped endpoints would move traffic to the backup backend if this
+    // reload applied; the undefined fallback target must reject it.
+    proxy.reload(&failover_yaml(proxy_port, backup.port(), primary.port(), "missing"));
+
+    let (status, body) = http_get(proxy.addr(), "/", None);
+    assert_eq!(status, 200, "should still serve after the invalid fallback config");
+    assert_eq!(body, "primary", "the old pipeline keeps serving");
+
+    primary.set_healthy(false);
+    let (status, body) = get_eventually(proxy.addr(), "/", |code, b| code == 200 && b == "backup");
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "backup"),
+        "the old pipeline still fails over once its primary is down"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // In-Flight Safety
 // ---------------------------------------------------------------------------
@@ -600,6 +631,54 @@ filter_chains:
           - name: backend
             endpoints:
               - "127.0.0.1:{backend_port}"
+"#
+    )
+}
+
+/// Proxy YAML routing to `primary`, which falls back to `fallback_cluster`;
+/// both clusters carry a fast HTTP health check.
+#[cfg(feature = "health-based-failover")]
+fn failover_yaml(proxy_port: u16, primary_port: u16, backup_port: u16, fallback_cluster: &str) -> String {
+    let health_check = r#"
+    health_check:
+      type: http
+      path: "/healthz"
+      interval_ms: 200
+      timeout_ms: 150
+      healthy_threshold: 1
+      unhealthy_threshold: 2"#;
+    format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_health_checks: true
+clusters:
+  - name: primary
+    endpoints:
+      - "127.0.0.1:{primary_port}"{health_check}
+  - name: backup
+    endpoints:
+      - "127.0.0.1:{backup_port}"{health_check}
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: primary
+      - filter: load_balancer
+        clusters:
+          - name: primary
+            endpoints:
+              - "127.0.0.1:{primary_port}"
+            fallback_cluster: {fallback_cluster}
+          - name: backup
+            endpoints:
+              - "127.0.0.1:{backup_port}"
 "#
     )
 }

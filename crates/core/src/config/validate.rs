@@ -10,12 +10,16 @@ pub use branch_chain::{
     MAX_BRANCH_DEPTH, MAX_ITERATIONS_CEILING, count_build_branches, validate_chain_entries_branch_chains,
 };
 pub(in crate::config) mod cluster;
+#[cfg(feature = "health-based-failover")]
+mod fallback;
 mod filter_chain;
 mod inline_clusters;
 mod listener;
 mod rules;
 
 pub use cluster::is_ssrf_sensitive;
+#[cfg(feature = "health-based-failover")]
+pub use fallback::{FallbackHealthContract, MAX_FALLBACK_CHAIN_EDGES, validate_chain_entries_health_contract};
 pub use filter_chain::{TERMINAL_FILTERS, validate_chain_entries_cardinality, validate_chain_entries_conditions};
 pub use inline_clusters::validate_chain_entries_inline_clusters;
 

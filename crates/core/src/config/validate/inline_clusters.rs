@@ -60,38 +60,64 @@ pub fn validate_chain_entries_inline_clusters(
     entries: &[FilterEntry],
     insecure_options: &InsecureOptions,
 ) -> Result<(), ProxyError> {
-    for entry in entries {
-        validate_entry(chain_name, entry, insecure_options)?;
-    }
+    for_each_inline_scope(chain_name, entries, &mut |scope_chain, entry, clusters| {
+        validate_scope(scope_chain, &entry.filter_type, &clusters, insecure_options)
+    })
+}
+
+/// Validate one inline `clusters:` list declared by a single filter entry.
+fn validate_scope(
+    chain_name: &str,
+    filter_type: &str,
+    clusters: &[Cluster],
+    insecure_options: &InsecureOptions,
+) -> Result<(), ProxyError> {
+    validate_inline_names(chain_name, filter_type, clusters)?;
+    validate_clusters(clusters, insecure_options)
+        .map_err(|err| ProxyError::Config(format!("chain '{chain_name}': filter '{filter_type}': inline {err}")))?;
+    #[cfg(feature = "health-based-failover")]
+    super::fallback::validate_fallback_clusters(&format!("chain '{chain_name}': filter '{filter_type}'"), clusters)?;
     Ok(())
 }
 
-/// Validate one filter entry and recurse into its inline branch chains.
-fn validate_entry(chain_name: &str, entry: &FilterEntry, insecure_options: &InsecureOptions) -> Result<(), ProxyError> {
-    if CLUSTER_BEARING_FILTERS.contains(&entry.filter_type.as_str()) {
-        let clusters = extract_clusters(chain_name, entry)?;
-        validate_inline_names(chain_name, &entry.filter_type, &clusters)?;
-        validate_clusters(&clusters, insecure_options).map_err(|err| {
-            ProxyError::Config(format!(
-                "chain '{chain_name}': filter '{}': inline {err}",
-                entry.filter_type
-            ))
-        })?;
-    }
+/// Callback for [`for_each_inline_scope`]: receives the logical chain name
+/// the scope belongs to, the filter entry declaring it, and its parsed
+/// clusters.
+pub(super) type ScopeVisitor<'visitor> =
+    dyn FnMut(&str, &FilterEntry, Vec<Cluster>) -> Result<(), ProxyError> + 'visitor;
 
-    for branch in entry.branch_chains.as_deref().unwrap_or_default() {
-        for chain_ref in &branch.chains {
-            if let ChainRef::Inline { name, filters } = chain_ref {
-                for nested in filters {
-                    validate_entry(name, nested, insecure_options)?;
+/// Visit every inline `clusters:` scope declared in `entries`.
+///
+/// A scope is the `clusters:` list of one `load_balancer` or
+/// `tcp_load_balancer` entry. Entries nested in inline branch chains are
+/// visited under the branch chain's name, and entries nested in
+/// `iterative_request_router` steps under the enclosing chain's name. Each
+/// entry's own scope is visited before its branch chains, then its steps.
+///
+/// # Errors
+///
+/// Returns [`ProxyError::Config`] if an inline `clusters:` list or step
+/// filter list is malformed, or the first error returned by `visit`.
+pub(super) fn for_each_inline_scope(
+    chain_name: &str,
+    entries: &[FilterEntry],
+    visit: &mut ScopeVisitor<'_>,
+) -> Result<(), ProxyError> {
+    for entry in entries {
+        if CLUSTER_BEARING_FILTERS.contains(&entry.filter_type.as_str()) {
+            visit(chain_name, entry, extract_clusters(chain_name, entry)?)?;
+        }
+
+        for branch in entry.branch_chains.as_deref().unwrap_or_default() {
+            for chain_ref in &branch.chains {
+                if let ChainRef::Inline { name, filters } = chain_ref {
+                    for_each_inline_scope(name, filters, visit)?;
                 }
             }
         }
-    }
 
-    if entry.filter_type == STEP_BEARING_FILTER {
-        for nested in extract_step_filters(chain_name, entry)? {
-            validate_entry(chain_name, &nested, insecure_options)?;
+        if entry.filter_type == STEP_BEARING_FILTER {
+            for_each_inline_scope(chain_name, &extract_step_filters(chain_name, entry)?, visit)?;
         }
     }
     Ok(())
@@ -114,40 +140,12 @@ fn validate_entry(chain_name: &str, entry: &FilterEntry, insecure_options: &Inse
 pub(super) fn collect_inline_clusters(chains: &[FilterChainConfig]) -> Result<Vec<Cluster>, ProxyError> {
     let mut out = Vec::new();
     for chain in chains {
-        for entry in &chain.filters {
-            collect_entry_inline_clusters(&chain.name, entry, &mut out)?;
-        }
+        for_each_inline_scope(&chain.name, &chain.filters, &mut |_, _, clusters| {
+            out.extend(clusters);
+            Ok(())
+        })?;
     }
     Ok(out)
-}
-
-/// Collect inline clusters from one filter entry, recursing into inline branch
-/// chains and `iterative_request_router` steps (mirrors [`validate_entry`]).
-fn collect_entry_inline_clusters(
-    chain_name: &str,
-    entry: &FilterEntry,
-    out: &mut Vec<Cluster>,
-) -> Result<(), ProxyError> {
-    if CLUSTER_BEARING_FILTERS.contains(&entry.filter_type.as_str()) {
-        out.extend(extract_clusters(chain_name, entry)?);
-    }
-
-    for branch in entry.branch_chains.as_deref().unwrap_or_default() {
-        for chain_ref in &branch.chains {
-            if let ChainRef::Inline { name, filters } = chain_ref {
-                for nested in filters {
-                    collect_entry_inline_clusters(name, nested, out)?;
-                }
-            }
-        }
-    }
-
-    if entry.filter_type == STEP_BEARING_FILTER {
-        for nested in extract_step_filters(chain_name, entry)? {
-            collect_entry_inline_clusters(chain_name, &nested, out)?;
-        }
-    }
-    Ok(())
 }
 
 /// Validate that every TCP listener's `cluster` reference resolves.

@@ -31,6 +31,10 @@ use std::{
     collections::HashMap,
 };
 
+#[cfg(feature = "health-based-failover")]
+use praxis_core::config::FallbackHealthContract;
+#[cfg(all(feature = "chain-binding", feature = "health-based-failover"))]
+use praxis_core::config::validate_chain_entries_health_contract;
 #[cfg(feature = "chain-binding")]
 use praxis_core::config::{
     ChainRef, validate_chain_entries_branch_chains, validate_chain_entries_cardinality,
@@ -213,6 +217,15 @@ pub struct ChainBindingContext<'a> {
         )
     )]
     branch_budget: &'a Cell<usize>,
+
+    /// The config's failover health contract, applied to bound outbound
+    /// chains: they never appear in `Config::filter_chains`, so the
+    /// whole-config validation cannot check them. `None` when the build was
+    /// started without one, as by [`FilterPipeline::build_with_chains`].
+    ///
+    /// [`FilterPipeline::build_with_chains`]: crate::FilterPipeline::build_with_chains
+    #[cfg(feature = "health-based-failover")]
+    health_contract: Option<&'a FallbackHealthContract>,
 }
 
 impl<'a> ChainBindingContext<'a> {
@@ -238,7 +251,17 @@ impl<'a> ChainBindingContext<'a> {
             insecure,
             budget,
             branch_budget,
+            #[cfg(feature = "health-based-failover")]
+            health_contract: None,
         }
+    }
+
+    /// Check every outbound chain bound through this context against
+    /// `health_contract`.
+    #[cfg(feature = "health-based-failover")]
+    pub(crate) fn with_health_contract(mut self, health_contract: Option<&'a FallbackHealthContract>) -> Self {
+        self.health_contract = health_contract;
+        self
     }
 
     /// Run `f` with a standalone binding context: no top-level named chains, a
@@ -314,6 +337,8 @@ impl<'a> ChainBindingContext<'a> {
             self.budget,
             self.branch_budget,
             self.outbound_depth,
+            #[cfg(feature = "health-based-failover")]
+            self.health_contract,
         )?;
         Ok(FilterPipeline::from_filters(filters))
     }
@@ -364,6 +389,8 @@ impl<'a> ChainBindingContext<'a> {
             self.budget,
             self.branch_budget,
             self.outbound_depth + 1,
+            #[cfg(feature = "health-based-failover")]
+            self.health_contract,
         )?;
         let pipeline = FilterPipeline::from_filters(filters);
         Self::reject_non_http_filters(&pipeline, name)?;
@@ -380,7 +407,8 @@ impl<'a> ChainBindingContext<'a> {
     /// bypass by never appearing in `Config::filter_chains`.
     ///
     /// Runs the same per-chain filter cardinality cap, empty-predicate condition
-    /// validation, inline-cluster SSRF/TLS gating, and branch-chain constraint
+    /// validation, inline-cluster SSRF/TLS gating, failover health contract
+    /// (when the build has one), and branch-chain constraint
     /// checks (the re-entrant `max_iterations` ceiling, nesting depth, name
     /// uniqueness, chain-reference resolution, and the total-branch ceiling) the
     /// whole-config validation applies to top-level chains.
@@ -402,6 +430,13 @@ impl<'a> ChainBindingContext<'a> {
         // posture — the same SSRF/insecure-TLS rules top-level clusters face.
         validate_chain_entries_inline_clusters(label, entries, self.insecure)
             .map_err(|e| FilterError::from(e.to_string()))?;
+        // Failover judges clusters only through their top-level health
+        // declarations, so a bound chain's fallback members must match one.
+        #[cfg(feature = "health-based-failover")]
+        if let Some(contract) = self.health_contract {
+            validate_chain_entries_health_contract(contract, label, entries)
+                .map_err(|e| FilterError::from(e.to_string()))?;
+        }
         // Enforce the core branch constraints here too. `Named` branch refs
         // resolve against the same top-level chains the runtime builder sees.
         //
@@ -977,6 +1012,149 @@ mod tests {
         };
         FilterPipeline::build_with_chains(&mut top, &registry, &chains, &insecure)
             .expect("outbound chain with an opted-in private endpoint must build");
+    }
+
+    // -------------------------------------------------------------------------
+    // Failover health contract on bound chains
+    // -------------------------------------------------------------------------
+
+    // The health contract of a config whose top-level `primary` and `backup`
+    // clusters declare health checks.
+    #[cfg(feature = "health-based-failover")]
+    fn failover_health_contract() -> FallbackHealthContract {
+        let config = praxis_core::config::Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: static_response
+        status: 200
+clusters:
+  - name: primary
+    endpoints: ["192.0.2.1:80"]
+    health_check:
+      type: tcp
+  - name: backup
+    endpoints: ["192.0.2.2:80"]
+    health_check:
+      type: tcp
+"#,
+        )
+        .expect("valid config");
+        FallbackHealthContract::from_config(&config).expect("health contract")
+    }
+
+    // An outbound chain whose `primary` cluster fails over to `fallback`,
+    // indented to sit under a `filters:` key at `indent` spaces.
+    #[cfg(feature = "health-based-failover")]
+    fn failover_outbound_callout(fallback: &str, indent: usize) -> String {
+        let yaml = format!(
+            "- filter: outbound_callout
+  outbound_chain:
+    name: outbound
+    filters:
+      - filter: load_balancer
+        clusters:
+          - name: primary
+            endpoints: [\"192.0.2.1:80\"]
+            fallback_cluster: {fallback}
+          - name: {fallback}
+            endpoints: [\"192.0.2.2:80\"]
+"
+        );
+        let pad = " ".repeat(indent);
+        yaml.lines().map(|line| format!("{pad}{line}\n")).collect()
+    }
+
+    // Build `top` with the failover health contract, skipping the ordering
+    // check a router-less outbound load balancer would otherwise fail.
+    #[cfg(feature = "health-based-failover")]
+    fn build_with_failover_contract(top: &mut [FilterEntry]) -> Result<FilterPipeline, FilterError> {
+        let mut registry = FilterRegistry::with_builtins();
+        register_outbound_callout(&mut registry);
+        let insecure = InsecureOptions {
+            skip_pipeline_checks: SkipPipelineChecks {
+                lb_without_router: true,
+                ..SkipPipelineChecks::default()
+            },
+            ..InsecureOptions::default()
+        };
+        FilterPipeline::build_with_chains_and_health_contract(
+            top,
+            &registry,
+            &HashMap::new(),
+            &insecure,
+            &failover_health_contract(),
+        )
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn inline_outbound_chain_fallback_member_without_health_declaration_rejected() {
+        let mut top = entries(&failover_outbound_callout("undeclared", 0));
+
+        let err = build_with_failover_contract(&mut top).err().expect("build should fail");
+
+        assert!(
+            err.to_string()
+                .contains("fallback-chain member 'undeclared' has no matching top-level health_check declaration"),
+            "a bound chain's fallback member needs a top-level health declaration, or failover never sees \
+             it as unhealthy: {err}"
+        );
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn inline_outbound_chain_fallback_members_with_health_declarations_bind() {
+        let mut top = entries(&failover_outbound_callout("backup", 0));
+
+        build_with_failover_contract(&mut top).expect("fallback members matching their top-level declarations bind");
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn health_contract_reaches_outbound_chains_bound_inside_branches() {
+        let mut top = entries(&format!(
+            "
+- filter: request_id
+  branch_chains:
+    - name: callout
+      rejoin: next
+      chains:
+        - name: inner
+          filters:
+{}",
+            failover_outbound_callout("undeclared", 12)
+        ));
+
+        let err = build_with_failover_contract(&mut top).err().expect("build should fail");
+
+        assert!(
+            err.to_string().contains("'undeclared'"),
+            "the contract must follow branch resolution into outbound bindings: {err}"
+        );
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn build_without_health_contract_leaves_bound_chains_unchecked() {
+        let mut registry = FilterRegistry::with_builtins();
+        register_outbound_callout(&mut registry);
+        let mut top = entries(&failover_outbound_callout("undeclared", 0));
+        let insecure = InsecureOptions {
+            skip_pipeline_checks: SkipPipelineChecks {
+                lb_without_router: true,
+                ..SkipPipelineChecks::default()
+            },
+            ..InsecureOptions::default()
+        };
+
+        FilterPipeline::build_with_chains(&mut top, &registry, &HashMap::new(), &insecure)
+            .expect("build_with_chains has no contract to apply");
     }
 
     // -------------------------------------------------------------------------

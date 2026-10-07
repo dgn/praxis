@@ -4,7 +4,6 @@
 //! TCP connection access log filter.
 
 use async_trait::async_trait;
-use tracing::info;
 
 use crate::{
     EmptyFilterConfig,
@@ -19,6 +18,12 @@ use crate::{
 // -----------------------------------------------------------------------------
 
 /// Logs TCP connection events.
+///
+/// With the `health-based-failover` build feature, both records also include
+/// `fallback_chain`: the walked cluster names joined by `,`, or `-` when no
+/// failover occurred. A `tcp_load_balancer` that declares `fallback_cluster`
+/// must run before this filter (enforced at config load) so the connect
+/// record logs the upstream and `fallback_chain` it selected.
 ///
 /// # YAML configuration
 ///
@@ -59,11 +64,14 @@ impl TcpFilter for TcpAccessLogFilter {
     }
 
     async fn on_connect(&self, ctx: &mut TcpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        info!(
-            remote = ctx.remote_addr,
-            local = ctx.local_addr,
-            upstream = ctx.upstream_addr.as_deref().unwrap_or("-"),
-            sni = ctx.sni.unwrap_or("-"),
+        info_with_fallback_chain!(
+            ctx,
+            {
+                remote = ctx.remote_addr,
+                local = ctx.local_addr,
+                upstream = ctx.upstream_addr.as_deref().unwrap_or("-"),
+                sni = ctx.sni.unwrap_or("-"),
+            },
             "TCP connection accepted"
         );
         Ok(FilterAction::Continue)
@@ -71,13 +79,16 @@ impl TcpFilter for TcpAccessLogFilter {
 
     async fn on_disconnect(&self, ctx: &mut TcpFilterContext<'_>) -> Result<(), FilterError> {
         let duration_ms = u64::try_from(ctx.connect_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-        info!(
-            remote = ctx.remote_addr,
-            upstream = ctx.upstream_addr.as_deref().unwrap_or("-"),
-            sni = ctx.sni.unwrap_or("-"),
-            duration_ms,
-            bytes_in = ctx.bytes_in,
-            bytes_out = ctx.bytes_out,
+        info_with_fallback_chain!(
+            ctx,
+            {
+                remote = ctx.remote_addr,
+                upstream = ctx.upstream_addr.as_deref().unwrap_or("-"),
+                sni = ctx.sni.unwrap_or("-"),
+                duration_ms,
+                bytes_in = ctx.bytes_in,
+                bytes_out = ctx.bytes_out,
+            },
             "TCP connection closed"
         );
         Ok(())
@@ -118,18 +129,7 @@ mod tests {
     #[tokio::test]
     async fn on_connect_returns_ok() {
         let filter = TcpAccessLogFilter;
-        let mut ctx = TcpFilterContext {
-            remote_addr: "127.0.0.1:12345",
-            local_addr: "0.0.0.0:9000",
-            sni: None,
-            upstream_addr: Some(std::borrow::Cow::Borrowed("10.0.0.1:80")),
-            cluster: None,
-            health_registry: None,
-            kv_stores: None,
-            connect_time: Instant::now(),
-            bytes_in: 0,
-            bytes_out: 0,
-        };
+        let mut ctx = test_ctx();
         let action = filter.on_connect(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "on_connect should continue");
     }
@@ -138,17 +138,65 @@ mod tests {
     async fn on_disconnect_returns_ok() {
         let filter = TcpAccessLogFilter;
         let mut ctx = TcpFilterContext {
+            bytes_in: 1024,
+            bytes_out: 2048,
+            ..test_ctx()
+        };
+        filter.on_disconnect(&mut ctx).await.unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "health-based-failover")]
+    fn records_log_the_fallback_chain() {
+        use std::sync::Arc;
+
+        let failed_over = TcpFilterContext {
+            fallback_chain: Some(Arc::from(["tcp-a", "tcp-b"].map(Arc::<str>::from))),
+            ..test_ctx()
+        };
+        for (mut ctx, chain) in [(test_ctx(), "-"), (failed_over, "tcp-a,tcp-b")] {
+            let logs = connection_logs(&mut ctx);
+            for record in ["TCP connection accepted", "TCP connection closed"] {
+                let line = logs
+                    .lines()
+                    .find(|line| line.contains(record))
+                    .unwrap_or_else(|| panic!("no {record:?} record: {logs}"));
+                assert!(
+                    line.contains(&format!("fallback_chain={chain}")),
+                    "{record:?} should log fallback_chain={chain}: {line}"
+                );
+            }
+        }
+    }
+
+    fn test_ctx() -> TcpFilterContext<'static> {
+        TcpFilterContext {
             remote_addr: "127.0.0.1:12345",
             local_addr: "0.0.0.0:9000",
             sni: None,
             upstream_addr: Some(std::borrow::Cow::Borrowed("10.0.0.1:80")),
             cluster: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: None,
             kv_stores: None,
             connect_time: Instant::now(),
-            bytes_in: 1024,
-            bytes_out: 2048,
-        };
-        filter.on_disconnect(&mut ctx).await.unwrap();
+            bytes_in: 0,
+            bytes_out: 0,
+        }
+    }
+
+    /// Run the connect and disconnect hooks for `ctx`, returning their logs.
+    #[cfg(feature = "health-based-failover")]
+    fn connection_logs(ctx: &mut TcpFilterContext<'_>) -> String {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        crate::test_utils::capture_logs(|| {
+            runtime.block_on(async {
+                let filter = TcpAccessLogFilter;
+                let action = filter.on_connect(ctx).await.unwrap();
+                assert!(matches!(action, FilterAction::Continue), "on_connect should continue");
+                filter.on_disconnect(ctx).await.unwrap();
+            });
+        })
     }
 }

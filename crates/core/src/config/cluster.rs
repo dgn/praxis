@@ -379,6 +379,23 @@ pub struct Cluster {
     #[cfg(feature = "slow-start")]
     #[serde(default)]
     pub slow_start: Option<SlowStartConfig>,
+
+    /// Name of the cluster to route to when all of this cluster's
+    /// endpoints are unhealthy.
+    ///
+    /// Valid only on an inline routing cluster (a `load_balancer` or
+    /// `tcp_load_balancer`'s `clusters:` entry); rejected on a
+    /// top-level health declaration. The reference chain is followed
+    /// as far as it is configured and is validated acyclic, bounded,
+    /// and protocol/provider-consistent at config load. See
+    /// `docs/operating/health-checking.md`.
+    #[cfg(feature = "health-based-failover")]
+    #[expect(
+        clippy::struct_field_names,
+        reason = "`fallback_cluster` is the documented config key; renaming it would break the schema"
+    )]
+    #[serde(default)]
+    pub fallback_cluster: Option<Arc<str>>,
 }
 
 impl ClusterHttpOptions {
@@ -462,6 +479,8 @@ impl Cluster {
             retry_policy: None,
             #[cfg(feature = "slow-start")]
             slow_start: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_cluster: None,
         }
     }
 }
@@ -689,6 +708,46 @@ http:
         assert!(
             cluster.http.application_provider.is_none(),
             "application_provider should default to None"
+        );
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn fallback_cluster_parses_and_serializes() {
+        let yaml = r#"
+name: "backend"
+endpoints: ["10.0.0.1:8080"]
+fallback_cluster: "backup"
+"#;
+        let cluster: Cluster = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cluster.fallback_cluster.as_deref(), Some("backup"));
+        let round_tripped = serde_yaml::to_string(&cluster).unwrap();
+        let reparsed: Cluster = serde_yaml::from_str(&round_tripped).unwrap();
+        assert_eq!(reparsed.fallback_cluster.as_deref(), Some("backup"));
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn fallback_cluster_defaults_to_none() {
+        let cluster = Cluster::with_defaults("web", vec!["10.0.0.1:80".into()]);
+        assert!(
+            cluster.fallback_cluster.is_none(),
+            "fallback_cluster should default to None"
+        );
+    }
+
+    #[cfg(not(feature = "health-based-failover"))]
+    #[test]
+    fn fallback_cluster_rejected_as_unknown_field_when_feature_off() {
+        let yaml = r#"
+name: "backend"
+endpoints: ["10.0.0.1:8080"]
+fallback_cluster: "backup"
+"#;
+        let err = serde_yaml::from_str::<Cluster>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("fallback_cluster") || err.to_string().contains("unknown field"),
+            "got: {err}"
         );
     }
 }

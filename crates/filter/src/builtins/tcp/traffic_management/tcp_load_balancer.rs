@@ -13,6 +13,8 @@ use praxis_core::{
 };
 use tracing::{debug, warn};
 
+#[cfg(feature = "health-based-failover")]
+use crate::load_balancing::failover::{self, FailoverSelection};
 use crate::{
     FilterError,
     actions::FilterAction,
@@ -48,6 +50,14 @@ struct TcpLoadBalancerConfig {
 ///
 /// If all endpoints are unhealthy, the filter enters panic mode and
 /// routes to all endpoints.
+///
+/// With the `health-based-failover` build feature, an inline cluster may also
+/// set `fallback_cluster` to another cluster in this filter's local
+/// `clusters:` list. When every endpoint in the routed cluster is unhealthy,
+/// the filter walks that chain until it finds the first healthy cluster or
+/// reaches the terminal cluster's panic mode. Every fallback-chain member must
+/// have a matching top-level health declaration with the same endpoint set;
+/// see `docs/operating/health-checking.md`.
 ///
 /// **Note:** `retry_policy` is an HTTP-only feature and is ignored for TCP
 /// listeners. The field appears in the cluster schema because the same
@@ -88,6 +98,23 @@ pub struct TcpLoadBalancerFilter {
     /// without a mutex.
     #[cfg(feature = "slow-start")]
     ramps: Vec<crate::load_balancing::slow_start::SlowStartBinding>,
+
+    /// Per-cluster `fallback_cluster` target.
+    #[cfg(feature = "health-based-failover")]
+    fallbacks: HashMap<Arc<str>, Arc<str>>,
+}
+
+/// Per-cluster `fallback_cluster` targets, keyed by cluster name.
+#[cfg(feature = "health-based-failover")]
+fn fallback_targets(clusters: &[Cluster]) -> HashMap<Arc<str>, Arc<str>> {
+    clusters
+        .iter()
+        .filter_map(|c| {
+            c.fallback_cluster
+                .clone()
+                .map(|fallback| (Arc::clone(&c.name), fallback))
+        })
+        .collect()
 }
 
 impl TcpLoadBalancerFilter {
@@ -112,6 +139,8 @@ impl TcpLoadBalancerFilter {
             clusters: map,
             #[cfg(feature = "slow-start")]
             ramps: slow_start_bindings(clusters),
+            #[cfg(feature = "health-based-failover")]
+            fallbacks: fallback_targets(clusters),
         }
     }
 
@@ -174,6 +203,35 @@ impl TcpLoadBalancerFilter {
             strategy.select(Some(client_ip), health, &[])
         }
     }
+
+    /// Walk the fallback chain from the routed [`TcpFilterContext::cluster`].
+    ///
+    /// Clears any chain left by an earlier selection. On failover, points
+    /// `ctx.cluster` at the effective cluster, records the walked chain, and
+    /// returns the [`FailoverSelection`].
+    #[cfg(feature = "health-based-failover")]
+    fn resolve_failover(&self, ctx: &mut TcpFilterContext<'_>) -> Result<Option<FailoverSelection>, FilterError> {
+        ctx.fallback_chain = None;
+        let Some(routed) = ctx.cluster.as_ref() else {
+            return Ok(None);
+        };
+        let registry = ctx.health_registry;
+        let selection = failover::walk(
+            routed,
+            |name| Self::cluster_health(registry, name).is_some_and(|health| health.all_unhealthy()),
+            |name| self.fallbacks.get(name).cloned(),
+        )?;
+        if let Some(selection) = &selection {
+            debug!(
+                routed = %selection.routed_cluster(),
+                effective = %selection.effective_cluster(),
+                "cluster unhealthy, routing to fallback chain"
+            );
+            ctx.cluster = Some(Arc::clone(selection.effective_cluster()));
+            ctx.fallback_chain = Some(Arc::clone(selection.chain()));
+        }
+        Ok(selection)
+    }
 }
 
 /// Bindings for clusters that configure a strategy which consumes the ramp.
@@ -198,12 +256,17 @@ impl TcpFilter for TcpLoadBalancerFilter {
         }
     }
 
+    #[cfg(feature = "health-based-failover")]
+    fn fallback_clusters(&self) -> Vec<String> {
+        self.fallbacks.values().map(ToString::to_string).collect()
+    }
+
     async fn on_connect(&self, ctx: &mut TcpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let Some(cluster) = ctx.cluster.as_ref() else {
-            return Err(
-                "tcp_load_balancer: no cluster set in context (is a cluster configured on the listener?)".into(),
-            );
-        };
+        #[cfg(feature = "health-based-failover")]
+        let fallback_selection = self.resolve_failover(ctx)?;
+        let cluster = ctx.cluster.as_ref().ok_or_else(|| -> FilterError {
+            "tcp_load_balancer: no cluster set in context (is a cluster configured on the listener?)".into()
+        })?;
         let cluster_name = cluster.as_ref();
 
         let strategy = self
@@ -227,6 +290,11 @@ impl TcpFilter for TcpLoadBalancerFilter {
                 format!("tcp_load_balancer: cluster '{cluster_name}' has no available endpoints").into()
             })?;
         debug!(cluster = %cluster_name, upstream = %addr, "TCP upstream selected");
+
+        #[cfg(feature = "health-based-failover")]
+        if let Some(selection) = &fallback_selection {
+            selection.record_hops();
+        }
 
         ctx.upstream_addr = Some(Cow::Owned(addr.to_string()));
 
@@ -453,6 +521,8 @@ mod tests {
                 sni: None,
                 upstream_addr: None,
                 cluster: Some(Arc::from("cache")),
+                #[cfg(feature = "health-based-failover")]
+                fallback_chain: None,
                 health_registry: None,
                 kv_stores: None,
                 connect_time: Instant::now(),
@@ -480,6 +550,8 @@ mod tests {
             sni: None,
             upstream_addr: None,
             cluster: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: None,
             kv_stores: None,
             connect_time: Instant::now(),
@@ -559,6 +631,8 @@ clusters:
             sni: None,
             upstream_addr: Some(Cow::Borrowed("10.0.0.1:5432")),
             cluster: None,
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: None,
             kv_stores: None,
             connect_time: Instant::now(),
@@ -604,6 +678,8 @@ clusters:
             sni: None,
             upstream_addr: None,
             cluster: Some(Arc::from(cluster)),
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: None,
             kv_stores: None,
             connect_time: Instant::now(),
@@ -620,11 +696,176 @@ clusters:
             sni: None,
             upstream_addr: None,
             cluster: Some(Arc::from(cluster)),
+            #[cfg(feature = "health-based-failover")]
+            fallback_chain: None,
             health_registry: Some(registry),
             kv_stores: None,
             connect_time: Instant::now(),
             bytes_in: 0,
             bytes_out: 0,
+        }
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    mod failover_tests {
+        use super::*;
+        use crate::test_utils::{cluster_with_fallback, metric_value, multi_health_registry};
+
+        /// In-flight count the least-connections strategy tracks for
+        /// `endpoint` in `cluster`, or `None` for another strategy.
+        fn least_connections_load(lb: &TcpLoadBalancerFilter, cluster: &str, endpoint: &str) -> Option<usize> {
+            match lb.clusters.get(cluster)? {
+                Strategy::LeastConnections(lc) => Some(lc.load_for(endpoint)),
+                _ => None,
+            }
+        }
+
+        #[tokio::test]
+        async fn all_unhealthy_primary_fails_over_to_healthy_fallback() {
+            let lb = TcpLoadBalancerFilter::new(&[
+                cluster_with_fallback("primary", &["10.0.0.1:5432"], "backup"),
+                test_cluster("backup", &["10.0.0.2:5432"]),
+            ]);
+            let registry = multi_health_registry(&[
+                ("primary", &["10.0.0.1:5432"], &[0]),
+                ("backup", &["10.0.0.2:5432"], &[]),
+            ]);
+            let mut ctx = make_ctx_with_health("primary", &registry);
+
+            lb.on_connect(&mut ctx).await.unwrap();
+
+            assert_eq!(
+                ctx.cluster.as_deref(),
+                Some("backup"),
+                "ctx.cluster should become the effective (fallback) cluster"
+            );
+            let chain = ctx.fallback_chain.as_ref().expect("fallback_chain should be set");
+            assert_eq!(
+                chain.as_ref(),
+                &[Arc::<str>::from("primary"), Arc::<str>::from("backup")]
+            );
+            assert_eq!(ctx.upstream_addr.as_deref(), Some("10.0.0.2:5432"));
+        }
+
+        #[tokio::test]
+        async fn healthy_primary_recovers_and_sets_no_fallback_chain() {
+            let lb = TcpLoadBalancerFilter::new(&[
+                cluster_with_fallback("primary", &["10.0.0.1:5432"], "backup"),
+                test_cluster("backup", &["10.0.0.2:5432"]),
+            ]);
+            let registry = multi_health_registry(&[("primary", &["10.0.0.1:5432"], &[])]);
+            let mut ctx = make_ctx_with_health("primary", &registry);
+
+            lb.on_connect(&mut ctx).await.unwrap();
+
+            assert_eq!(ctx.cluster.as_deref(), Some("primary"));
+            assert!(ctx.fallback_chain.is_none());
+            assert_eq!(ctx.upstream_addr.as_deref(), Some("10.0.0.1:5432"));
+        }
+
+        #[tokio::test]
+        async fn exhausted_chain_lands_on_last_cluster_for_panic_mode() {
+            crate::test_utils::install_metrics_recorder();
+
+            let lb = TcpLoadBalancerFilter::new(&[
+                cluster_with_fallback("tcp_a", &["10.0.1.1:5432"], "tcp_b"),
+                test_cluster("tcp_b", &["10.0.1.2:5432"]),
+            ]);
+            let registry =
+                multi_health_registry(&[("tcp_a", &["10.0.1.1:5432"], &[0]), ("tcp_b", &["10.0.1.2:5432"], &[0])]);
+            let mut ctx = make_ctx_with_health("tcp_a", &registry);
+
+            lb.on_connect(&mut ctx).await.unwrap();
+
+            assert_eq!(
+                ctx.cluster.as_deref(),
+                Some("tcp_b"),
+                "panic mode selects from the last cluster in the chain"
+            );
+            assert!(ctx.upstream_addr.is_some());
+            assert_eq!(
+                metric_value(r#"praxis_lb_fallback_total{cluster="tcp_a",fallback="tcp_b"}"#).as_deref(),
+                Some("1"),
+                "the walked hop is counted once"
+            );
+            assert_eq!(
+                metric_value(r#"praxis_lb_panic_mode_total{cluster="tcp_b"}"#).as_deref(),
+                Some("1"),
+                "panic-mode attribution should name the effective (last) cluster"
+            );
+            assert_eq!(
+                metric_value(r#"praxis_lb_panic_mode_total{cluster="tcp_a"}"#),
+                None,
+                "the routed cluster is not attributed with panic mode"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_fallback_cluster_configured_behaves_like_before() {
+            let lb = TcpLoadBalancerFilter::new(&[test_cluster("solo_tcp", &["10.0.2.1:5432"])]);
+            let registry = multi_health_registry(&[("solo_tcp", &["10.0.2.1:5432"], &[0])]);
+            let mut ctx = make_ctx_with_health("solo_tcp", &registry);
+
+            lb.on_connect(&mut ctx).await.unwrap();
+
+            assert_eq!(ctx.cluster.as_deref(), Some("solo_tcp"));
+            assert!(ctx.fallback_chain.is_none());
+        }
+
+        #[tokio::test]
+        async fn disconnect_releases_the_endpoint_on_the_fallback_cluster() {
+            let lb = TcpLoadBalancerFilter::new(&[
+                cluster_with_fallback("primary", &["10.0.0.1:5432"], "backup"),
+                cluster_with_strategy(
+                    "backup",
+                    &["10.0.0.2:5432"],
+                    LoadBalancerStrategy::Simple(SimpleStrategy::LeastConnections),
+                ),
+            ]);
+            let registry = multi_health_registry(&[("primary", &["10.0.0.1:5432"], &[0])]);
+            let mut ctx = make_ctx_with_health("primary", &registry);
+
+            lb.on_connect(&mut ctx).await.unwrap();
+            assert_eq!(
+                least_connections_load(&lb, "backup", "10.0.0.2:5432"),
+                Some(1),
+                "the fallback endpoint is counted in flight"
+            );
+
+            lb.on_disconnect(&mut ctx).await.unwrap();
+            assert_eq!(
+                least_connections_load(&lb, "backup", "10.0.0.2:5432"),
+                Some(0),
+                "on_disconnect releases the endpoint on the fallback cluster"
+            );
+        }
+
+        #[tokio::test]
+        async fn stale_fallback_chain_is_cleared_when_the_routed_cluster_is_healthy() {
+            let lb = TcpLoadBalancerFilter::new(&[
+                cluster_with_fallback("primary", &["10.0.0.1:5432"], "backup"),
+                test_cluster("backup", &["10.0.0.2:5432"]),
+            ]);
+            let registry = multi_health_registry(&[("primary", &["10.0.0.1:5432"], &[])]);
+            let mut ctx = make_ctx_with_health("primary", &registry);
+            ctx.fallback_chain = Some(Arc::from([Arc::<str>::from("stale-a"), Arc::from("stale-b")]));
+
+            lb.on_connect(&mut ctx).await.unwrap();
+
+            assert!(
+                ctx.fallback_chain.is_none(),
+                "a chain left by an earlier selection must not describe this one"
+            );
+        }
+
+        #[test]
+        fn fallback_clusters_lists_declared_targets() {
+            let lb = TcpLoadBalancerFilter::new(&[
+                cluster_with_fallback("primary", &["10.0.0.1:5432"], "backup"),
+                test_cluster("backup", &["10.0.0.2:5432"]),
+            ]);
+
+            assert_eq!(lb.fallback_clusters(), vec!["backup".to_owned()]);
         }
     }
 }

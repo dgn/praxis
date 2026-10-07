@@ -28,6 +28,7 @@ access-log-syslog = ["praxis/access-log-syslog"]
 hedged-requests = ["praxis/hedged-requests"]
 no-mac-cert-rotation-tests = []
 otel = ["praxis/otel"]
+health-based-failover = ["praxis/health-based-failover"]
 
 [lints]
 workspace = true

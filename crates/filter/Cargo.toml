@@ -71,6 +71,11 @@ spiffe = []
 # socket, UDP, or TCP). Off by default; experimental. Pulls in the `syslog`
 # crate, which is kept out of the default and FIPS builds.
 access-log-syslog = ["dep:syslog"]
+# Per-cluster health-based failover: `fallback_cluster` on inline routing
+# clusters, the failover walk, and the associated access-log/metrics fields.
+# Off by default; experimental. The protocol crate's
+# `health-based-failover` turns it on.
+health-based-failover = ["praxis-core/health-based-failover"]
 
 # This crate inherits the full workspace lint set. Unlike the other crates it
 # does NOT raise `unsafe_code` back to "forbid": the `json_ops::simd_scan` SIMD

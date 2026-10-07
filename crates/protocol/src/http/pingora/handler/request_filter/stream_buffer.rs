@@ -13,7 +13,7 @@ use praxis_filter::{
 };
 use tracing::{debug, warn};
 
-use crate::http::pingora::context::PingoraRequestCtx;
+use crate::http::pingora::context::{PingoraRequestCtx, take_fallback_chain, write_back_fallback_chain};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -173,6 +173,7 @@ pub(super) async fn pre_read_body(
         let action = pipeline
             .execute_http_request_body(&mut filter_ctx, &mut body, end_of_stream)
             .await;
+        let fallback_chain = take_fallback_chain(&mut filter_ctx);
 
         // Restore the prior log (filters never write it) and append this
         // pass's mutations, before the copy-backs partially move filter_ctx.
@@ -193,6 +194,7 @@ pub(super) async fn pre_read_body(
 
         ctx.request_body_bytes = original_body_bytes;
         ctx.cluster = filter_ctx.cluster;
+        write_back_fallback_chain(ctx, fallback_chain);
         ctx.rewritten_path = filter_ctx.rewritten_path;
         ctx.upstream = filter_ctx.upstream;
         ctx.attempted_endpoints = filter_ctx.attempted_endpoints;

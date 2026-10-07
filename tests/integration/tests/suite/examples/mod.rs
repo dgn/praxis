@@ -49,6 +49,8 @@ mod guardrails_per_model;
 mod head_classifier;
 mod header_manipulation;
 mod header_presence_condition;
+#[cfg(feature = "health-based-failover")]
+mod health_based_failover;
 mod health_checks;
 #[cfg(feature = "hedged-requests")]
 mod hedged_requests;

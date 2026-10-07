@@ -12,6 +12,7 @@ spiffe = ["praxis-core/spiffe"]
 upstream-binding = ["praxis-core/upstream-binding"]
 slow-start = ["praxis-core/slow-start"]
 cloud-events-filter = ["praxis-filter/cloud-events-filter"]
+health-based-failover = ["praxis-core/health-based-failover"]
 
 [lints]
 workspace = true

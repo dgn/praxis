@@ -54,7 +54,7 @@ use crate::{
 /// ```yaml
 /// filter: access_log
 /// sample_rate: 0.1   # optional; log ~10% of requests (default 1.0)
-/// fields:            # optional; replaces default ten fields when present
+/// fields:            # optional; replaces the default field set when present
 ///   - method
 ///   - path
 ///   - status
@@ -81,9 +81,11 @@ use crate::{
 /// request_headers: [user-agent]
 /// ```
 ///
-/// When `fields` is omitted, the default ten fields are emitted:
+/// When `fields` is omitted, the default ten fields are emitted
+/// (eleven with `health-based-failover`):
 /// `method`, `path`, `client_ip`, `status`, `duration_ms`, `cluster`,
-/// `upstream`, `request_id`, `request_body_bytes`, `response_body_bytes`.
+/// `upstream`, `request_id`, `request_body_bytes`, `response_body_bytes`
+/// and, with `health-based-failover`, `fallback_chain`.
 ///
 /// When `template` is set, the rendered string is logged as the `line` field of
 /// the `access` event; `PRAXIS_LOG_FORMAT` still decides whether the subscriber
@@ -143,7 +145,8 @@ struct AccessLogConfig {
     #[serde(default = "default_sample_rate")]
     sample_rate: f64,
 
-    /// Scalar field tokens; replaces the default ten when present.
+    /// Scalar field tokens; replaces the default ten fields when present
+    /// (eleven with `health-based-failover`, which adds `fallback_chain`).
     /// Mutually exclusive with `template`.
     fields: Option<Vec<serde_yaml::Value>>,
 
@@ -504,6 +507,8 @@ const DEFAULT_FIELDS: &[&str] = &[
     "request_id",
     "request_body_bytes",
     "response_body_bytes",
+    #[cfg(feature = "health-based-failover")]
+    "fallback_chain",
 ];
 
 // -----------------------------------------------------------------------------
@@ -533,6 +538,11 @@ enum FieldToken {
     ResponseHeader(String),
     /// A filter-metadata key, such as `llm.model`.
     Metadata(String),
+    /// Health-based-failover chain walked for this request, routed cluster
+    /// first and effective cluster last, joined by `,`. Renders `-` when no
+    /// failover occurred (or no load balancer with `fallback_cluster` ran).
+    #[cfg(feature = "health-based-failover")]
+    FallbackChain,
 }
 
 /// A segment in a parsed text template: a static string or an interpolated field.
@@ -1479,21 +1489,24 @@ impl AccessLogFilter {
         serde_json::to_string(&record).unwrap_or_default()
     }
 
-    /// Default ten-field emit path.
+    /// Default ten-field emit path (eleven with `health-based-failover`).
     fn emit_default(ctx: &HttpFilterContext<'_>, status: u16, duration_ms: u64) {
         let path = sanitize_for_log(ctx.request.uri.path());
         let client_ip = ctx.client_addr.map(|a| a.to_string()).unwrap_or_default();
-        info!(
-            method = %ctx.request.method,
-            path = %path,
-            client_ip = %client_ip,
-            status,
-            duration_ms,
-            cluster = ctx.cluster_name().unwrap_or("-"),
-            upstream = ctx.upstream_addr().unwrap_or("-"),
-            request_id = ctx.request_id().unwrap_or("-"),
-            request_body_bytes = ctx.request_body_bytes,
-            response_body_bytes = ctx.response_body_bytes,
+        info_with_fallback_chain!(
+            ctx,
+            {
+                method = %ctx.request.method,
+                path = %path,
+                client_ip = %client_ip,
+                status,
+                duration_ms,
+                cluster = ctx.cluster_name().unwrap_or("-"),
+                upstream = ctx.upstream_addr().unwrap_or("-"),
+                request_id = ctx.request_id().unwrap_or("-"),
+                request_body_bytes = ctx.request_body_bytes,
+                response_body_bytes = ctx.response_body_bytes,
+            },
             "access"
         );
     }
@@ -1689,35 +1702,41 @@ pub fn emit_access_record(ctx: &HttpFilterContext<'_>, status: u16) {
 
     #[cfg(feature = "otel")]
     if let Some((trace_id, span_id)) = extract_otel_ids() {
-        info!(
-            method = %ctx.request.method,
-            path = %path,
-            client_ip = %client_ip,
-            cluster = ctx.cluster_name().unwrap_or("-"),
-            duration_ms = truncate_u128(ctx.request_start.elapsed().as_millis()),
-            request_body_bytes = ctx.request_body_bytes,
-            request_id = ctx.request_id().unwrap_or("-"),
-            response_body_bytes = ctx.response_body_bytes,
-            span_id = %span_id,
-            status,
-            trace_id = %trace_id,
-            upstream = ctx.upstream_addr().unwrap_or("-"),
+        info_with_fallback_chain!(
+            ctx,
+            {
+                method = %ctx.request.method,
+                path = %path,
+                client_ip = %client_ip,
+                cluster = ctx.cluster_name().unwrap_or("-"),
+                duration_ms = truncate_u128(ctx.request_start.elapsed().as_millis()),
+                request_body_bytes = ctx.request_body_bytes,
+                request_id = ctx.request_id().unwrap_or("-"),
+                response_body_bytes = ctx.response_body_bytes,
+                span_id = %span_id,
+                status,
+                trace_id = %trace_id,
+                upstream = ctx.upstream_addr().unwrap_or("-"),
+            },
             "access"
         );
         return;
     }
 
-    info!(
-        method = %ctx.request.method,
-        path = %path,
-        client_ip = %client_ip,
-        status,
-        duration_ms = truncate_u128(ctx.request_start.elapsed().as_millis()),
-        cluster = ctx.cluster_name().unwrap_or("-"),
-        upstream = ctx.upstream_addr().unwrap_or("-"),
-        request_id = ctx.request_id().unwrap_or("-"),
-        request_body_bytes = ctx.request_body_bytes,
-        response_body_bytes = ctx.response_body_bytes,
+    info_with_fallback_chain!(
+        ctx,
+        {
+            method = %ctx.request.method,
+            path = %path,
+            client_ip = %client_ip,
+            status,
+            duration_ms = truncate_u128(ctx.request_start.elapsed().as_millis()),
+            cluster = ctx.cluster_name().unwrap_or("-"),
+            upstream = ctx.upstream_addr().unwrap_or("-"),
+            request_id = ctx.request_id().unwrap_or("-"),
+            request_body_bytes = ctx.request_body_bytes,
+            response_body_bytes = ctx.response_body_bytes,
+        },
         "access"
     );
 }
@@ -1816,6 +1835,10 @@ fn build_record_from_fields(
             FieldToken::Metadata(key) => {
                 let value = ctx.get_metadata(key).unwrap_or("-").to_owned();
                 record.insert(format!("metadata.{key}"), value);
+            },
+            #[cfg(feature = "health-based-failover")]
+            FieldToken::FallbackChain => {
+                record.insert("fallback_chain".to_owned(), ctx.fallback_chain_field());
             },
         }
     }
@@ -2021,6 +2044,8 @@ fn parse_scalar_field_token(token: &str) -> Result<FieldToken, FilterError> {
         "response_body_bytes" => Ok(FieldToken::ResponseBodyBytes),
         "trace_id" => Ok(FieldToken::TraceId),
         "span_id" => Ok(FieldToken::SpanId),
+        #[cfg(feature = "health-based-failover")]
+        "fallback_chain" => Ok(FieldToken::FallbackChain),
         "filter_results" => Err("access_log: filter_results is not supported in v1".into()),
         other => Err(format!("access_log: unknown field token {other:?}").into()),
     }

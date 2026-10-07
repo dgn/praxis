@@ -5,6 +5,10 @@
 
 Logs TCP connection events.
 
+## Configuration Notes
+
+With the `health-based-failover` build feature, both records also include `fallback_chain`: the walked cluster names joined by `,`, or `-` when no failover occurred. A `tcp_load_balancer` that declares `fallback_cluster` must run before this filter (enforced at config load) so the connect record logs the upstream and `fallback_chain` it selected.
+
 ## Example
 
 ```yaml

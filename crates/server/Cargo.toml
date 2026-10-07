@@ -89,6 +89,14 @@ hedged-requests = ["praxis-protocol/hedged-requests", "experimental"]
 # The `access_log` syslog sink (RFC 3164 over unix/UDP/TCP). Off by default;
 # experimental. Pulls in the `syslog` crate, kept out of the default/FIPS builds.
 access-log-syslog = ["praxis-filter/access-log-syslog", "experimental"]
+# Per-cluster health-based failover (`fallback_cluster`). Off by default;
+# experimental.
+health-based-failover = [
+    "praxis-core/health-based-failover",
+    "praxis-filter/health-based-failover",
+    "praxis-protocol/health-based-failover",
+    "experimental",
+]
 # The `policy` filter (Praxis Policy Engine). On by default. The workspace
 # declares praxis-filter with `default-features = false`, so this feature is
 # the only thing that turns the filter's `policy-engine` on; a

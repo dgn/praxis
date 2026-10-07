@@ -34,6 +34,13 @@ fn every_example_resolves_its_pipelines() {
         if path.file_name().is_some_and(|name| name == "slow-start.yaml") {
             continue;
         }
+        #[cfg(not(feature = "health-based-failover"))]
+        if path
+            .file_name()
+            .is_some_and(|name| name == "health-based-failover.yaml")
+        {
+            continue;
+        }
         match resolve(&path) {
             Ok(()) => validated += 1,
             Err(error) if environmental(&error) => {},

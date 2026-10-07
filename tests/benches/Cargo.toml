@@ -107,4 +107,5 @@ harness = false
 policy-engine = ["praxis-filter/policy-engine"]
 upstream-binding = ["praxis-filter/upstream-binding"]
 slow-start = ["praxis-core/slow-start", "praxis-filter/slow-start"]
+health-based-failover = ["praxis-filter/health-based-failover"]
 dhat-heap = ["dep:dhat"]

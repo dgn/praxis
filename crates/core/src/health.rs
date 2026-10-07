@@ -385,6 +385,19 @@ impl ClusterHealthEntry {
     pub fn passive_unhealthy_threshold(&self) -> Option<u32> {
         self.passive_unhealthy_threshold
     }
+
+    /// Whether every tracked endpoint in this cluster is unhealthy.
+    ///
+    /// Returns `false` for a cluster with no tracked endpoints — "no
+    /// endpoints" and "all endpoints down" are distinct states, and only
+    /// the latter triggers [health-based
+    /// failover](crate::config::Cluster::fallback_cluster). This is
+    /// separate from the panic-mode selection path, which still treats
+    /// "all unhealthy" as "select from all endpoints anyway".
+    #[cfg(feature = "health-based-failover")]
+    pub fn all_unhealthy(&self) -> bool {
+        !self.endpoints.is_empty() && self.endpoints.iter().all(|ep| !ep.is_healthy())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -447,6 +460,55 @@ mod tests {
             entry.is_address_healthy("unknown:80"),
             "an untracked address is treated as healthy"
         );
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn all_unhealthy_empty_endpoints() {
+        let entry = ClusterHealthEntry::new(vec![], vec![], None, None);
+        assert!(
+            !entry.all_unhealthy(),
+            "no tracked endpoints is distinct from all endpoints down"
+        );
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn all_unhealthy_all_up() {
+        let entry = ClusterHealthEntry::new(
+            vec![EndpointHealth::new(), EndpointHealth::new()],
+            vec![Arc::from("a:80"), Arc::from("b:80")],
+            None,
+            None,
+        );
+        assert!(!entry.all_unhealthy());
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn all_unhealthy_all_down() {
+        let entry = ClusterHealthEntry::new(
+            vec![EndpointHealth::new(), EndpointHealth::new()],
+            vec![Arc::from("a:80"), Arc::from("b:80")],
+            None,
+            None,
+        );
+        entry.endpoints()[0].mark_unhealthy();
+        entry.endpoints()[1].mark_unhealthy();
+        assert!(entry.all_unhealthy());
+    }
+
+    #[cfg(feature = "health-based-failover")]
+    #[test]
+    fn all_unhealthy_mixed() {
+        let entry = ClusterHealthEntry::new(
+            vec![EndpointHealth::new(), EndpointHealth::new()],
+            vec![Arc::from("a:80"), Arc::from("b:80")],
+            None,
+            None,
+        );
+        entry.endpoints()[0].mark_unhealthy();
+        assert!(!entry.all_unhealthy(), "one healthy endpoint means not all unhealthy");
     }
 
     #[test]

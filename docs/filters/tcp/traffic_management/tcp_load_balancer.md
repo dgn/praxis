@@ -11,6 +11,8 @@ Reads `ctx.cluster` to find the target cluster, selects an endpoint via the conf
 
 If all endpoints are unhealthy, the filter enters panic mode and routes to all endpoints.
 
+With the `health-based-failover` build feature, an inline cluster may also set `fallback_cluster` to another cluster in this filter's local `clusters:` list. When every endpoint in the routed cluster is unhealthy, the filter walks that chain until it finds the first healthy cluster or reaches the terminal cluster's panic mode. Every fallback-chain member must have a matching top-level health declaration with the same endpoint set; see `docs/operating/health-checking.md`.
+
 **Note:** `retry_policy` is an HTTP-only feature and is ignored for TCP listeners. The field appears in the cluster schema because the same `Cluster` type is shared across protocols.
 
 ## Configuration
@@ -80,6 +82,7 @@ If all endpoints are unhealthy, the filter enters panic mode and routes to all e
 | `clusters[].slow_start` | SlowStartConfig | no | Ramp newly added and newly recovered endpoints up to their configured weight. Requires the `slow-start` Cargo feature, which is off by default. Weighted strategies apply the ramp while choosing an endpoint. Hash strategies keep the configured weight. Omit it to give every eligible endpoint its configured weight immediately. See [`SlowStartConfig`]. |
 | `clusters[].slow_start.window_ms` | integer | yes | Duration of the ramp, in milliseconds. Must be at least 1 and at most one hour. Over this span the endpoint's effective weight grows from 0 to its configured weight. |
 | `clusters[].slow_start.aggression` | number | no | Curve of the ramp. `1.0` (the default) is linear. Must be finite and in `(0, 100]`. |
+| `clusters[].fallback_cluster` | string | no | Name of the cluster to route to when all of this cluster's endpoints are unhealthy. Valid only on an inline routing cluster (a `load_balancer` or `tcp_load_balancer`'s `clusters:` entry); rejected on a top-level health declaration. The reference chain is followed as far as it is configured and is validated acyclic, bounded, and protocol/provider-consistent at config load. See `docs/operating/health-checking.md`. |
 
 ## Example
 

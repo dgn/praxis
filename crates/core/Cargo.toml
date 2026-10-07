@@ -31,6 +31,9 @@ upstream-binding = []
 # weighted strategies apply the ramp. Hash strategies do not. Without this
 # feature the field is an unknown key.
 slow-start = []
+# Per-cluster health-based failover (`fallback_cluster`). Off by default;
+# experimental. The filter crate's `health-based-failover` turns it on.
+health-based-failover = []
 spiffe = ["praxis-tls/spiffe"]
 test-support = []
 otel = [

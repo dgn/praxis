@@ -1,0 +1,134 @@
+# Health-Based Failover
+#
+# Routes to a fallback cluster when every endpoint in the routed cluster is
+# unhealthy. The primary cluster uses sticky sessions with failover disabled,
+# but an all-down primary still discards that pin for the request and can
+# re-pin into the fallback cluster's own sticky store. Each cluster uses its
+# own cookie name so a fallback cookie never replaces the primary session,
+# and recovery returns the client to its original primary endpoint.
+#
+# ⚠️  EXPERIMENTAL: This example uses the `health-based-failover` experimental feature.
+# Not recommended for production use. Build with --features health-based-failover.
+#
+# Usage:
+#   cargo run -p praxis-proxy --features health-based-failover -- -c examples/configs/traffic-management/health-based-failover.yaml
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+admin:
+  address: "127.0.0.1:9090"
+
+insecure_options:
+  allow_private_endpoints: true      # example proxies to local backends
+  allow_private_health_checks: true  # dev only; allows loopback probes
+
+clusters:
+  - name: app-primary
+    endpoints:
+      - "127.0.0.1:3001"
+      - "127.0.0.1:3002"
+    health_check:
+      type: http
+      path: "/healthz"
+      expected_status: 200
+      interval_ms: 5000
+      timeout_ms: 2000
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+
+  - name: app-secondary
+    endpoints:
+      - "127.0.0.1:3011"
+      - "127.0.0.1:3012"
+    health_check:
+      type: http
+      path: "/healthz"
+      expected_status: 200
+      interval_ms: 5000
+      timeout_ms: 2000
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+
+  - name: app-tertiary
+    endpoints:
+      - "127.0.0.1:3021"
+      - "127.0.0.1:3022"
+    health_check:
+      type: http
+      path: "/healthz"
+      expected_status: 200
+      interval_ms: 5000
+      timeout_ms: 2000
+      healthy_threshold: 2
+      unhealthy_threshold: 3
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: app-primary
+
+      - filter: sticky_sessions
+        clusters:
+          - name: app-primary
+            type: cookie
+            cookie_name: "_praxis_primary"
+            ttl_secs: 3600
+            cookie_attributes:
+              path: "/"
+              http_only: true
+            failover: false
+            max_entries: 10000
+            eviction: lru
+          - name: app-secondary
+            type: cookie
+            cookie_name: "_praxis_secondary"
+            ttl_secs: 3600
+            cookie_attributes:
+              path: "/"
+              http_only: true
+            failover: true
+            max_entries: 10000
+            eviction: lru
+          - name: app-tertiary
+            type: cookie
+            cookie_name: "_praxis_tertiary"
+            ttl_secs: 3600
+            cookie_attributes:
+              path: "/"
+              http_only: true
+            failover: true
+            max_entries: 10000
+            eviction: lru
+
+      - filter: load_balancer
+        clusters:
+          - name: app-primary
+            endpoints:
+              - "127.0.0.1:3001"
+              - "127.0.0.1:3002"
+            fallback_cluster: app-secondary
+          - name: app-secondary
+            endpoints:
+              - "127.0.0.1:3011"
+              - "127.0.0.1:3012"
+            fallback_cluster: app-tertiary
+          - name: app-tertiary
+            endpoints:
+              - "127.0.0.1:3021"
+              - "127.0.0.1:3022"
+
+      - filter: access_log
+        fields:
+          - method
+          - path
+          - status
+          - cluster
+          - upstream
+          - fallback_chain

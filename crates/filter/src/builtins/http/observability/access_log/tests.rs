@@ -4,6 +4,7 @@
 //! Behaviour tests for the access log filter.
 
 use super::*;
+use crate::test_utils::capture_logs;
 
 fn test_filter(config: &serde_yaml::Value) -> AccessLogFilter {
     let cfg: AccessLogConfig = parse_filter_config("access_log", config).unwrap();
@@ -909,36 +910,6 @@ fn normalized_ipv4_formats_without_mapped_prefix() {
 // Emission Shape (unchanged)
 // -------------------------------------------------------------------------
 
-/// Capture `tracing` output emitted synchronously by `f` on this thread.
-fn capture_logs<F: FnOnce()>(f: F) -> String {
-    use std::io::Write;
-
-    #[derive(Clone)]
-    struct Buffer(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for Buffer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("buffer lock").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
-    let writer = buffer.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    tracing::subscriber::with_default(subscriber, f);
-    let bytes = buffer.0.lock().expect("buffer lock").clone();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
 #[test]
 fn no_record_work_when_info_level_disabled() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("fields: [method, path, status]").unwrap();
@@ -1173,6 +1144,106 @@ fn deferred_record_ignores_stray_grpc_status_on_non_grpc_request() {
             "a non-gRPC request must always log; a stray grpc-status must not enable sampling: {logged:?}"
         );
     }
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn fallback_chain_token_parses() {
+    let token = parse_scalar_field_token("fallback_chain").unwrap();
+    assert!(matches!(token, FieldToken::FallbackChain), "got {token:?}");
+}
+
+#[test]
+#[cfg(not(feature = "health-based-failover"))]
+fn fallback_chain_token_requires_the_feature() {
+    let err = parse_scalar_field_token("fallback_chain").unwrap_err();
+    assert!(err.to_string().contains("unknown field token"), "got: {err}");
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn build_record_renders_the_fallback_chain() {
+    let fields = [FieldToken::Cluster, FieldToken::FallbackChain];
+    let req = crate::test_utils::make_request(http::Method::GET, "/");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.cluster = Some(Arc::from("primary"));
+    let direct = build_record_from_fields(&fields, &ctx, 200, None, 0);
+    assert_eq!(direct.get("cluster").map(String::as_str), Some("primary"));
+    assert_eq!(
+        direct.get("fallback_chain").map(String::as_str),
+        Some("-"),
+        "a request served by its routed cluster renders a dash"
+    );
+
+    fail_over(&mut ctx);
+    let failed_over = build_record_from_fields(&fields, &ctx, 200, None, 0);
+    assert_eq!(failed_over.get("cluster").map(String::as_str), Some("backup"));
+    assert_eq!(
+        failed_over.get("fallback_chain").map(String::as_str),
+        Some("primary,backup"),
+        "the walked chain runs from the routed cluster to the effective one"
+    );
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn default_record_logs_the_fallback_chain() {
+    let filter = test_filter(&serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let req = crate::test_utils::make_request(http::Method::GET, "/");
+
+    let mut direct = crate::test_utils::make_filter_context(&req);
+    let logged = capture_logs(|| filter.maybe_emit(&mut direct, 200, None));
+    assert!(
+        logged.contains("fallback_chain=-"),
+        "no failover logs a dash: {logged:?}"
+    );
+
+    let mut failed_over = crate::test_utils::make_filter_context(&req);
+    fail_over(&mut failed_over);
+    let logged = capture_logs(|| filter.maybe_emit(&mut failed_over, 200, None));
+    assert!(
+        logged.contains(r#"cluster="backup""#) && logged.contains("fallback_chain=primary,backup"),
+        "the record names the effective cluster and the walked chain: {logged:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn deferred_record_projects_the_fallback_chain() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("fields: [cluster, fallback_chain]").unwrap();
+    let filter = test_filter(&yaml);
+    let req = crate::test_utils::make_request(http::Method::GET, "/");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    fail_over(&mut ctx);
+
+    let logged = capture_logs(|| {
+        assert!(filter.emit_deferred_record(&ctx, 502), "the filter claims the record");
+    });
+    assert!(
+        logged.contains(r#"record={"cluster":"backup","fallback_chain":"primary,backup"}"#),
+        "the projected deferred record carries the walked chain: {logged:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "health-based-failover")]
+fn fallback_access_record_logs_the_fallback_chain() {
+    let req = crate::test_utils::make_request(http::Method::GET, "/");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    fail_over(&mut ctx);
+
+    let logged = capture_logs(|| emit_access_record(&ctx, 502));
+    assert!(
+        logged.contains(r#"cluster="backup""#) && logged.contains("fallback_chain=primary,backup"),
+        "the protocol-layer fallback record carries the walked chain: {logged:?}"
+    );
+}
+
+/// Record a failover from the routed `primary` to the effective `backup`.
+#[cfg(feature = "health-based-failover")]
+fn fail_over(ctx: &mut HttpFilterContext<'_>) {
+    ctx.cluster = Some(Arc::from("backup"));
+    ctx.fallback_chain = Some(Arc::from(["primary", "backup"].map(Arc::<str>::from)));
 }
 
 fn grpc_request() -> crate::context::Request {
