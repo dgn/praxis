@@ -55,7 +55,6 @@
 
 use std::{
     fs,
-    net::SocketAddr,
     path::Path,
     process::{Command, Output},
     sync::{
@@ -71,10 +70,11 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 };
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    free_port, http_get,
+    bind_unique_port, free_port, http_get,
     net::tls::{TestCertificates, ensure_crypto_provider},
-    start_proxy, wait_for_tcp,
+    start_proxy,
 };
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Identity, ServerTlsConfig};
 
 const CHILD_MODE_ENV: &str = "PRAXIS_OTLP_EXPORTER_TEST_CHILD";
@@ -145,12 +145,15 @@ fn start_collector(
     runtime: &tokio::runtime::Runtime,
     certificates: Option<&TestCertificates>,
 ) -> (u16, Arc<CollectorState>) {
-    let port = free_port();
+    // Bind up front so no other bind-to-0 can claim the port in between.
+    let (listener, port) = bind_unique_port();
+    listener
+        .set_nonblocking(true)
+        .expect("test collector listener nonblocking");
     let state = Arc::new(CollectorState::default());
     let collector = FakeCollector {
         state: Arc::clone(&state),
     };
-    let address: SocketAddr = ([127, 0, 0, 1], port).into();
 
     let server = tonic::transport::Server::builder();
     let mut server = if let Some(certificates) = certificates {
@@ -165,13 +168,13 @@ fn start_collector(
     };
 
     runtime.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("test collector listener upgrade");
         server
             .add_service(TraceServiceServer::new(collector))
-            .serve(address)
+            .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("serve OTLP test collector");
     });
-    wait_for_tcp(&format!("127.0.0.1:{port}"));
     (port, state)
 }
 

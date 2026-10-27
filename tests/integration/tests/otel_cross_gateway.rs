@@ -71,15 +71,39 @@ use praxis_core::{
     subrequest::{StreamLimits, SubRequest, SubRequestClient, SubRequestConnector},
 };
 use praxis_test_utils::{
-    Backend, free_port, http_send, parse_body, parse_status, read_http_request, spawn_raw_http_backend,
-    start_full_proxy, start_header_echo_backend, start_proxy, start_slow_backend, wait_for_tcp,
+    Backend, bind_unique_port, free_port, http_send, parse_body, parse_status, read_http_request,
+    spawn_raw_http_backend, start_full_proxy, start_header_echo_backend, start_proxy, start_slow_backend, wait_for_tcp,
 };
+use tokio_stream::wrappers::TcpListenerStream;
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 #[derive(Clone, Default)]
 struct CapturedSpans {
     requests: Arc<Mutex<Vec<ExportTraceServiceRequest>>>,
+}
+
+/// Spawn the OTLP span collector on a pre-bound, registered port.
+///
+/// The listener is bound up front and handed to tonic, so no other
+/// bind-to-0 can claim the port in between. Keep the returned runtime
+/// alive while the collector must serve; dropping it stops the server.
+fn spawn_collector(collector: CapturedSpans) -> (tokio::runtime::Runtime, u16) {
+    let (listener, port) = bind_unique_port();
+    listener.set_nonblocking(true).expect("collector listener nonblocking");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("collector runtime");
+    runtime.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("collector listener upgrade");
+        tonic::transport::Server::builder()
+            .add_service(TraceServiceServer::new(collector))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .expect("collector server");
+    });
+    (runtime, port)
 }
 
 #[tonic::async_trait]
@@ -105,21 +129,7 @@ impl TraceService for CapturedSpans {
 )]
 fn exported_parentage_links_edge_provider_and_backend() {
     let collector = CapturedSpans::default();
-    let collector_port = free_port();
-    let collector_addr: SocketAddr = ([127, 0, 0, 1], collector_port).into();
-    let collector_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("collector runtime");
-    let collector_service = collector.clone();
-    collector_runtime.spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(collector_service))
-            .serve(collector_addr)
-            .await
-            .expect("collector server");
-    });
-    wait_for_tcp(&format!("127.0.0.1:{collector_port}"));
+    let (collector_runtime, collector_port) = spawn_collector(collector.clone());
 
     let backend = start_header_echo_backend();
     let subrequest_backend = start_header_echo_backend();
@@ -491,21 +501,7 @@ fn sampled_remote_parent_overrides_zero_root_rate() {
     }
 
     let collector = CapturedSpans::default();
-    let collector_port = free_port();
-    let collector_addr: SocketAddr = ([127, 0, 0, 1], collector_port).into();
-    let collector_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("collector runtime");
-    let collector_service = collector.clone();
-    collector_runtime.spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(collector_service))
-            .serve(collector_addr)
-            .await
-            .expect("collector server");
-    });
-    wait_for_tcp(&format!("127.0.0.1:{collector_port}"));
+    let (_collector_runtime, collector_port) = spawn_collector(collector.clone());
 
     let backend = start_header_echo_backend();
     let provider_port = free_port();
@@ -580,21 +576,7 @@ fn response_attempt_client_spans_record_final_status_and_actual_close() {
     }
 
     let collector = CapturedSpans::default();
-    let collector_port = free_port();
-    let collector_addr: SocketAddr = ([127, 0, 0, 1], collector_port).into();
-    let collector_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("collector runtime");
-    let collector_service = collector.clone();
-    collector_runtime.spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(collector_service))
-            .serve(collector_addr)
-            .await
-            .expect("collector server");
-    });
-    wait_for_tcp(&format!("127.0.0.1:{collector_port}"));
+    let (collector_runtime, collector_port) = spawn_collector(collector.clone());
 
     let (interim_port, interim_server) = spawn_raw_http_backend(|mut stream| {
         read_http_request(&mut stream);
@@ -898,21 +880,7 @@ fn cloud_events_delivery_keeps_the_request_span_as_parent() {
     }
 
     let collector = CapturedSpans::default();
-    let collector_port = free_port();
-    let collector_addr: SocketAddr = ([127, 0, 0, 1], collector_port).into();
-    let collector_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("collector runtime");
-    let collector_service = collector.clone();
-    collector_runtime.spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(collector_service))
-            .serve(collector_addr)
-            .await
-            .expect("collector server");
-    });
-    wait_for_tcp(&format!("127.0.0.1:{collector_port}"));
+    let (_collector_runtime, collector_port) = spawn_collector(collector.clone());
 
     let backend = start_header_echo_backend();
     let (event_received, event_waiter) = mpsc::sync_channel(0);
@@ -1047,21 +1015,7 @@ fn cloud_events_fallback_dispatch_keeps_the_request_span_as_parent() {
     }
 
     let collector = CapturedSpans::default();
-    let collector_port = free_port();
-    let collector_addr: SocketAddr = ([127, 0, 0, 1], collector_port).into();
-    let collector_runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("collector runtime");
-    let collector_service = collector.clone();
-    collector_runtime.spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(TraceServiceServer::new(collector_service))
-            .serve(collector_addr)
-            .await
-            .expect("collector server");
-    });
-    wait_for_tcp(&format!("127.0.0.1:{collector_port}"));
+    let (_collector_runtime, collector_port) = spawn_collector(collector.clone());
 
     let (event_sent, event_waiter) = mpsc::sync_channel(0);
     let (event_port, event_receiver) = spawn_raw_http_backend(move |mut stream| {
