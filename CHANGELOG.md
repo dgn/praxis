@@ -33,6 +33,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- The FIPS runtime probe selects the Pingora backend when compiling its
+  listener tests with default features disabled.
 - The Hyper backend rejects reserved client trailer names before forwarding
   or retaining them for replay, including streamed and pre-read uploads.
 - The Hyper backend applies the retry policy to failures on pooled
